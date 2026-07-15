@@ -12,6 +12,7 @@
 import fs from 'fs';
 import eventHub from './EventHub.mjs';
 import fetch from 'node-fetch';
+import WebSocketImpl from 'ws';
 
 import Logger from './Logger.mjs';
 const logger = new Logger('NetworkModule');
@@ -23,6 +24,7 @@ import idManager from './IdManager.mjs';
 
 // variables
 const API_URL = 'https://attitude.lighting/api/v1/device/sync';  // URL to hit with a POST request
+const WS_URL = 'wss://attitude.lighting/ws';  // WebSocket gateway URL, tried before falling back to API_URL
 
 const USE_LOCALHOST = false;  // set to true to use the attitudelighting.test API_URL instead (FOR DEVELOPMENT ONLY)
 const LAPTOP_MODE = (process.platform == 'darwin');  // checks whether we're running on macos (laptop mode) or not
@@ -30,6 +32,14 @@ const LAPTOP_MODE = (process.platform == 'darwin');  // checks whether we're run
 const PING_INTERVAL = 1000;  // interval in ms to ping the server (should be 1000ms)
 const MAX_ERROR_COUNT = 5; // max number of failed requests before payload will be saved to missed messages queue
 const NETWORK_REQUEST_TIMEOUT_MS = 15000;  // number of milliseconds to wait before considering the last request to have timed out
+
+// WebSocket gateway is tried first for every request; if it's unavailable, unreachable, or
+// drops mid-flight, this module transparently falls back to the HTTP transport above with
+// no change in behavior from the server's point of view. Set to false to force HTTP-only
+// (e.g. if the gateway needs to be pulled from rotation for troubleshooting).
+const ENABLE_WEBSOCKET_TRANSPORT = true;
+const WS_CONNECT_TIMEOUT_MS = 5000;  // how long to wait for the WS handshake before giving up on this attempt
+const WS_RECONNECT_INTERVAL_MS = 30000;  // how often to retry connecting the WebSocket while on the HTTP fallback
 
 const VERBOSE_LOGGING = false;
 
@@ -55,6 +65,18 @@ class NetworkModule {
         if (USE_LOCALHOST && LAPTOP_MODE) {
         	this.url = 'http://attitudelighting.test/api/v1/device/sync';
         }
+
+        // WebSocket transport state. this.ws is only ever a socket in the OPEN state;
+        // as soon as it closes/errors it's nulled out and performNetworkRequest falls
+        // straight back to HTTP on its very next call.
+        this.wsUrl = WS_URL;
+        if (USE_LOCALHOST && LAPTOP_MODE) {
+        	this.wsUrl = 'ws://attitudelighting.test/ws';
+        }
+        this.ws = null;
+        this.wsConnecting = false;
+        this.wsReconnectTimer = null;
+        this.pendingPayload = null;  // payload currently in flight over the WebSocket, awaiting a response message
 
         // Initialize queue of objects that are pending to be sent to the server
         // these objects might be logs, current status objects, data from external devices, etc.
@@ -104,6 +126,12 @@ class NetworkModule {
 
         // start the interval for sending network requests
         this.startInterval();
+
+        // kick off a WebSocket connection attempt in the background; performNetworkRequest
+        // will use it once open, and keeps using HTTP until then (or if it later drops)
+        if (ENABLE_WEBSOCKET_TRANSPORT) {
+        	this.connectWebSocket();
+        }
 
         // bind event listeners for logging and status updates
         eventHub.on('log', this.logListener.bind(this));
@@ -227,7 +255,20 @@ class NetworkModule {
     	// log the entire request object
     	// console.log(JSON.stringify(requestObject));
 
-    	// Make a POST request to the API endpoint with the request data
+    	// prefer the WebSocket gateway when it's connected; otherwise fall back to HTTP.
+    	// Both paths funnel into the same onNetworkRequestSuccess/onNetworkRequestError
+    	// methods, so error counting, missed-message handling, and moduleStatus events
+    	// behave identically regardless of which transport carried this particular request.
+    	if (this.isWebSocketConnected()) {
+    		this.sendViaWebSocket(requestObject, payload);
+    	} else {
+    		this.sendViaHttp(requestObject, payload);
+    	}
+    }
+
+
+    // send the request over HTTP (the original transport, and the permanent fallback)
+    sendViaHttp(requestObject, payload) {
 		fetch(this.url, {
 		    method: 'POST',
 		    headers: {
@@ -238,9 +279,6 @@ class NetworkModule {
 
 		// handle the response asynchronously
 		.then(response => {
-			// no matter the result, change the flag to indicate that the request is no longer in progress
-			this.requestInProgress = false;
-
 			// check response status (response.ok will return true if the HTTP code is anything 200-299)
 		    if (!response.ok) {
 		    	// if not ok, throw an error
@@ -252,75 +290,203 @@ class NetworkModule {
 	    		logger.info(`${response.status} ${response.statusText} request successful! Connected to attitude.lighting server!`);
 	    	}
 
-    		// if there had previously been errors, then flag that we need to grab the missed messages out of local file storage
-    		if (this.errorCounter > MAX_ERROR_COUNT) {
-    			this.loadMissedNetworkMessagesFlag = true;
-
-    			if (configManager.checkLogLevel('detail')) {
-	    			logger.info('Successfully reconnected to the attitude.lighting server! Begin restoring missed network messages.');
-	    		}
-
-    			// emit a moduleStatus event since we just reconnected
-	    		eventHub.emit('moduleStatus', { 
-	    			name: 'NetworkModule', 
-	    			status: 'operational',
-	    			data: 'Successfully reconnected to the attitude.lighting server!',
-	    		});
-    		} else {
-    			// otherwise, we've been online, so emit a moduleStatus event that we are online
-	    		eventHub.emit('moduleStatus', { 
-	    			name: 'NetworkModule', 
-	    			status: 'online',
-	    			data: 'Connected to the attitude.lighting server!',
-	    		});
-    		}
-
-    		// reset the error counter
-    		this.errorCounter = 0;
-
 		    // return the body text of the response
 		    return response.text();
 		})
 
 		// then handle the data from the response
 		.then(data => {
-    		// handle the response data
-    		this.handleResponse(data);
-
-		    // NOTE: because of the error handling logic below, 
-		    // errors here in processing of received data will cause a re-transfer of previous data.
-		    // So it's important to try to avoid errors here in this function when processing response data
-		    // after data is succesfully sent to server.
+    		this.onNetworkRequestSuccess(payload, data);
 		})
 
 		// and catch any errors that occur
 		.catch(error => {
-			// even though it's an error, still change the flag to indicate that the request is no longer in progress
-			this.requestInProgress = false;
-
-			// log error to logger, which will show in console and queue log to be sent to server
-    		logger.error(`Error during network request: ${error.message}`);
-
-			// emit an event because we are currently offline
-    		eventHub.emit('moduleStatus', { 
-    			name: 'NetworkModule', 
-    			status: 'offline',
-    			data: `Error during network request: ${error.message}`,
-    		});
-
-    		// add this error to the counter
-    		this.errorCounter++;
-
-    		// if error count is greater than the max, then we need to start saving the missed data to a file, 
-    		// instead of just to the queue, so that it can be re-sent later
-    		if (this.errorCounter > MAX_ERROR_COUNT) {
-    			this.savePayloadToFile(payload);
-    		} else {
-    			// otherwise, these messages should just be added back to the queue and re-sent to server.
-	    		// unshift the queue by adding this payload (which failed) to the front
-	    		this.queue.unshift(...payload);
-    		}
+    		this.onNetworkRequestError(payload, error);
 		});
+    }
+
+
+    // send the request over the WebSocket gateway. The response arrives asynchronously via
+    // the 'message' handler registered in connectWebSocket(), which resolves this.pendingPayload.
+    sendViaWebSocket(requestObject, payload) {
+    	try {
+    		this.pendingPayload = payload;
+    		this.ws.send(JSON.stringify(requestObject));
+    	} catch (error) {
+    		this.pendingPayload = null;
+    		this.onNetworkRequestError(payload, error);
+    		this.handleWebSocketFailure();
+    	}
+    }
+
+
+    // shared success handling for both transports
+    onNetworkRequestSuccess(payload, rawData) {
+		// no matter the result, change the flag to indicate that the request is no longer in progress
+		this.requestInProgress = false;
+
+		// if there had previously been errors, then flag that we need to grab the missed messages out of local file storage
+		if (this.errorCounter > MAX_ERROR_COUNT) {
+			this.loadMissedNetworkMessagesFlag = true;
+
+			if (configManager.checkLogLevel('detail')) {
+    			logger.info('Successfully reconnected to the attitude.lighting server! Begin restoring missed network messages.');
+    		}
+
+			// emit a moduleStatus event since we just reconnected
+    		eventHub.emit('moduleStatus', {
+    			name: 'NetworkModule',
+    			status: 'operational',
+    			data: 'Successfully reconnected to the attitude.lighting server!',
+    		});
+		} else {
+			// otherwise, we've been online, so emit a moduleStatus event that we are online
+    		eventHub.emit('moduleStatus', {
+    			name: 'NetworkModule',
+    			status: 'online',
+    			data: 'Connected to the attitude.lighting server!',
+    		});
+		}
+
+		// reset the error counter
+		this.errorCounter = 0;
+
+		// handle the response data
+		this.handleResponse(rawData);
+
+	    // NOTE: because of the error handling logic below,
+	    // errors here in processing of received data will cause a re-transfer of previous data.
+	    // So it's important to try to avoid errors here in this function when processing response data
+	    // after data is succesfully sent to server.
+    }
+
+
+    // shared error handling for both transports
+    onNetworkRequestError(payload, error) {
+		// even though it's an error, still change the flag to indicate that the request is no longer in progress
+		this.requestInProgress = false;
+
+		// log error to logger, which will show in console and queue log to be sent to server
+		logger.error(`Error during network request: ${error.message}`);
+
+		// emit an event because we are currently offline
+		eventHub.emit('moduleStatus', {
+			name: 'NetworkModule',
+			status: 'offline',
+			data: `Error during network request: ${error.message}`,
+		});
+
+		// add this error to the counter
+		this.errorCounter++;
+
+		// if error count is greater than the max, then we need to start saving the missed data to a file,
+		// instead of just to the queue, so that it can be re-sent later
+		if (this.errorCounter > MAX_ERROR_COUNT) {
+			this.savePayloadToFile(payload);
+		} else {
+			// otherwise, these messages should just be added back to the queue and re-sent to server.
+    		// unshift the queue by adding this payload (which failed) to the front
+    		this.queue.unshift(...payload);
+		}
+    }
+
+
+    // whether the WebSocket transport is currently usable
+    isWebSocketConnected() {
+    	return !!(this.ws && this.ws.readyState === WebSocketImpl.OPEN);
+    }
+
+
+    // attempt to establish the WebSocket connection to the gateway. Safe to call repeatedly;
+    // no-ops if already connected or an attempt is already in progress.
+    connectWebSocket() {
+    	if (this.wsConnecting || this.isWebSocketConnected()) {
+    		return;
+    	}
+    	this.wsConnecting = true;
+
+    	if (configManager.checkLogLevel('detail')) {
+    		logger.info(`Attempting WebSocket connection to ${this.wsUrl}...`);
+    	}
+
+    	let socket;
+    	try {
+    		socket = new WebSocketImpl(this.wsUrl);
+    	} catch (error) {
+    		logger.warn(`Failed to open WebSocket: ${error.message}`);
+    		this.wsConnecting = false;
+    		this.scheduleWebSocketReconnect();
+    		return;
+    	}
+
+    	// if the handshake itself hangs, give up on this attempt and fall back to HTTP;
+    	// scheduleWebSocketReconnect (triggered by the resulting 'close') will try again later
+    	const connectTimeout = setTimeout(() => {
+    		if (socket.readyState !== WebSocketImpl.OPEN) {
+    			logger.warn(`WebSocket connection attempt to ${this.wsUrl} timed out, using HTTP for now.`);
+    			socket.terminate();
+    		}
+    	}, WS_CONNECT_TIMEOUT_MS);
+
+    	socket.on('open', () => {
+    		clearTimeout(connectTimeout);
+    		this.wsConnecting = false;
+    		this.ws = socket;
+
+    		logger.info('WebSocket connection established! Using WebSocket transport for device sync.');
+    		eventHub.emit('moduleStatus', {
+    			name: 'NetworkModule',
+    			status: 'online',
+    			data: 'Connected to the attitude.lighting server via WebSocket!',
+    		});
+    	});
+
+    	socket.on('message', (raw) => {
+    		const payload = this.pendingPayload || [];
+    		this.pendingPayload = null;
+    		this.onNetworkRequestSuccess(payload, raw.toString());
+    	});
+
+    	socket.on('close', () => {
+    		clearTimeout(connectTimeout);
+    		this.wsConnecting = false;
+    		if (this.ws === socket) {
+    			this.ws = null;
+    		}
+    		this.handleWebSocketFailure();
+    	});
+
+    	socket.on('error', (error) => {
+    		// 'close' always follows 'error' for the ws package, which does the actual cleanup/reconnect scheduling
+    		logger.warn(`WebSocket error: ${error.message}`);
+    	});
+    }
+
+
+    // called whenever the WebSocket is not (or is no longer) usable: fails any in-flight
+    // request immediately (rather than waiting out the HTTP-style timeout) so
+    // performNetworkRequest picks HTTP on its very next tick, and schedules a reconnect attempt.
+    handleWebSocketFailure() {
+    	if (this.pendingPayload) {
+    		const payload = this.pendingPayload;
+    		this.pendingPayload = null;
+    		this.onNetworkRequestError(payload, new Error('WebSocket connection closed'));
+    	}
+
+    	this.scheduleWebSocketReconnect();
+    }
+
+
+    // retry the WebSocket connection periodically while on the HTTP fallback
+    scheduleWebSocketReconnect() {
+    	if (this.wsReconnectTimer || !ENABLE_WEBSOCKET_TRANSPORT) {
+    		return;
+    	}
+
+    	this.wsReconnectTimer = setTimeout(() => {
+    		this.wsReconnectTimer = null;
+    		this.connectWebSocket();
+    	}, WS_RECONNECT_INTERVAL_MS);
     }
 
 
