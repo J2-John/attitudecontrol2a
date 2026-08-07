@@ -79,6 +79,11 @@ class UDPManager {
 
 	// handleMessage - process an incoming UDP message
 	handleMessage(message, info) {
+		// TEMPORARY INSTRUMENTATION - count all inbound datagrams before any parsing
+		if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+		globalThis.__ATTPERF.udpPackets++;
+		globalThis.__ATTPERF.udpBytes += message.length;
+
 		try {
 			// parse message into JSON
 			let parsed = JSON.parse(message.toString());
