@@ -71,7 +71,12 @@ class AttitudeScheduler {
     init() {
         // Start the scheduling interval to run processSchedule function
         this.processScheduleInterval = setInterval(() => {
+            // TEMPORARY INSTRUMENTATION
+            if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+            const __t = process.hrtime.bigint();
             this.processSchedule();
+            globalThis.__ATTPERF.schedCalls++;
+            globalThis.__ATTPERF.schedNs += (process.hrtime.bigint() - __t);
         }, PROCESS_SCHEDULE_INTERVAL);
 
         // bind senseDataListener callback to senseData event emitted
@@ -101,7 +106,13 @@ class AttitudeScheduler {
 		}
 
 		// actuall process schedule
+		// TEMPORARY INSTRUMENTATION
+		if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+		globalThis.__ATTPERF.senseTriggers++;
+		const __t2 = process.hrtime.bigint();
     	this.processSchedule();
+		globalThis.__ATTPERF.schedCalls++;
+		globalThis.__ATTPERF.schedNs += (process.hrtime.bigint() - __t2);
     }
 
     // process the schedule at regular intervals
