@@ -11,6 +11,7 @@
 // import modules
 import os from 'os';
 import fs from 'fs';
+import { exec } from 'child_process';
 import eventHub from './EventHub.mjs';
 
 import Logger from './Logger.mjs';
@@ -23,6 +24,13 @@ import configManager from './ConfigManager.mjs';
 // variables
 const SAMPLE_INTERVAL = 15000;  // interval for how often to check system status (should be 15000ms)
 
+// CPU frequency restoration (added 2026-08)
+// Some field devices have scaling_max_freq latched down to 100MHz of a 1512MHz capability,
+// which is why they render at 5-20fps instead of 40. This restores the ceiling, but only
+// while the device is cool, and gives up rather than fighting the kernel's thermal management.
+const TEMP_RESTORE_MAX_C = 70;            // refuse to raise the ceiling at or above this temperature
+const MAX_RESTORE_ATTEMPTS_PER_HOUR = 6;  // stop retrying if the kernel keeps re-clamping
+
 
 
 // Define the StatusTracker class
@@ -32,6 +40,11 @@ class StatusTracker {
     constructor() {
         // minimum and maximum interval to send a status update
         this.sampleInterval = SAMPLE_INTERVAL;
+
+        // CPU frequency restoration state
+        this.freqRestoreAttempts = [];
+        this.freqRestoreInFlight = false;
+        this.freqRestoreState = 'unknown';
 
         // emit an event that the statusTracker is initializing
         eventHub.emit('moduleStatus', { 
@@ -72,6 +85,9 @@ class StatusTracker {
             // read CPU frequency, governor and temperature (added 2026-08 to diagnose slow devices)
             const cpuStatus = this.readCpuStatus();
 
+            // repair a latched-down CPU frequency ceiling if it is safe to do so
+            this.maintainCpuFrequency(cpuStatus);
+
             // create an object with the current system status in it
             const currentSystemStatus = {
                 timestamp: new Date(),
@@ -89,6 +105,7 @@ class StatusTracker {
                 cpuFreqHwMaxMHz: cpuStatus.cpuFreqHwMaxMHz,
                 cpuGovernor: cpuStatus.cpuGovernor,
                 cpuTempC: cpuStatus.cpuTempC,
+                cpuFreqRestoreState: this.freqRestoreState,
 
                 totalMemory: this.formatBytes(os.totalmem()),
                 freeMemory: this.formatBytes(os.freemem()),
@@ -117,6 +134,80 @@ class StatusTracker {
                 status: 'errored',
                 data: `Error processing system status: ${error}`,
             });
+        }
+    }
+
+
+    // maintainCpuFrequency - restore a latched-down CPU frequency ceiling.
+    // Deliberately conservative: does nothing on a healthy device, refuses to raise the
+    // ceiling on a hot device, and stops retrying rather than fighting thermal management.
+    maintainCpuFrequency(cpuStatus) {
+        try {
+            const currentMax = cpuStatus.cpuFreqMaxMHz;
+            const hardwareMax = cpuStatus.cpuFreqHwMaxMHz;
+            const temperature = cpuStatus.cpuTempC;
+
+            // platform does not expose cpufreq (macOS development, or no driver) - do nothing
+            if (!Number.isFinite(currentMax) || !Number.isFinite(hardwareMax)) {
+                this.freqRestoreState = 'unsupported';
+                return;
+            }
+
+            // ceiling is already correct - this is the healthy case and the common case
+            if (currentMax >= hardwareMax) {
+                this.freqRestoreState = 'ok';
+                return;
+            }
+
+            // a previous write has not completed yet
+            if (this.freqRestoreInFlight) {
+                return;
+            }
+
+            // refuse to raise the ceiling on a hot device. the clamp may be protecting it.
+            if (Number.isFinite(temperature) && temperature >= TEMP_RESTORE_MAX_C) {
+                this.freqRestoreState = 'holding, too hot (' + temperature + 'C)';
+                return;
+            }
+
+            // if the kernel keeps re-clamping, stop fighting it and report that we gave up
+            const now = Date.now();
+            this.freqRestoreAttempts = this.freqRestoreAttempts.filter(t => (now - t) < 3600000);
+            if (this.freqRestoreAttempts.length >= MAX_RESTORE_ATTEMPTS_PER_HOUR) {
+                this.freqRestoreState = 'gave up after ' + this.freqRestoreAttempts.length + ' attempts';
+                return;
+            }
+
+            // validate the value before it goes anywhere near a shell
+            const targetKhz = Math.round(hardwareMax) * 1000;
+            if (!Number.isInteger(targetKhz) || targetKhz <= 0 || targetKhz > 10000000) {
+                this.freqRestoreState = 'invalid target';
+                return;
+            }
+
+            this.freqRestoreAttempts.push(now);
+            this.freqRestoreInFlight = true;
+            this.freqRestoreState = 'restoring to ' + hardwareMax + 'MHz';
+
+            logger.warn(`CPU max frequency is clamped at ${currentMax}MHz of ${hardwareMax}MHz capability at ${temperature}C. Restoring the ceiling.`);
+
+            // write to every CPU policy, asynchronously, so the render loop is never blocked
+            const command = "sudo sh -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do echo " + targetKhz + " > \"$f\"; done'";
+
+            exec(command, { timeout: 10000 }, (error) => {
+                this.freqRestoreInFlight = false;
+
+                if (error) {
+                    this.freqRestoreState = 'restore failed';
+                    logger.error(`Failed to restore CPU max frequency: ${error}`);
+                } else {
+                    this.freqRestoreState = 'restored to ' + hardwareMax + 'MHz';
+                    logger.warn(`Restored CPU max frequency to ${hardwareMax}MHz.`);
+                }
+            });
+        } catch (error) {
+            this.freqRestoreState = 'error';
+            logger.error(`Error maintaining CPU frequency: ${error}`);
         }
     }
 
