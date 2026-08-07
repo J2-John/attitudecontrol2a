@@ -10,6 +10,7 @@
 
 // import modules
 import os from 'os';
+import fs from 'fs';
 import eventHub from './EventHub.mjs';
 
 import Logger from './Logger.mjs';
@@ -68,6 +69,9 @@ class StatusTracker {
                 data: '',
             });
 
+            // read CPU frequency, governor and temperature (added 2026-08 to diagnose slow devices)
+            const cpuStatus = this.readCpuStatus();
+
             // create an object with the current system status in it
             const currentSystemStatus = {
                 timestamp: new Date(),
@@ -78,6 +82,13 @@ class StatusTracker {
 
                 cpuCount: os.cpus().length,
                 cpuUsage: os.loadavg().map(num => num.toFixed(2)),
+
+                cpuFreqMHz: cpuStatus.cpuFreqMHz,
+                cpuFreqMinMHz: cpuStatus.cpuFreqMinMHz,
+                cpuFreqMaxMHz: cpuStatus.cpuFreqMaxMHz,
+                cpuFreqHwMaxMHz: cpuStatus.cpuFreqHwMaxMHz,
+                cpuGovernor: cpuStatus.cpuGovernor,
+                cpuTempC: cpuStatus.cpuTempC,
 
                 totalMemory: this.formatBytes(os.totalmem()),
                 freeMemory: this.formatBytes(os.freemem()),
@@ -107,6 +118,36 @@ class StatusTracker {
                 data: `Error processing system status: ${error}`,
             });
         }
+    }
+
+
+    // helper to read a single sysfs value. returns null if the file is missing or unreadable,
+    // which is the normal case on macOS during development or on a board without cpufreq exposed.
+    readSysfs(path) {
+        try {
+            return fs.readFileSync(path, 'utf8').trim();
+        } catch (error) {
+            return null;
+        }
+    }
+
+
+    // read CPU frequency, governor and temperature. all values null where unavailable.
+    readCpuStatus() {
+        const base = '/sys/devices/system/cpu/cpu0/cpufreq/';
+
+        // sysfs reports frequency in kHz and temperature in millidegrees C
+        const toMHz = (value) => (value === null ? null : Math.round(Number(value) / 1000));
+        const rawTemp = this.readSysfs('/sys/class/thermal/thermal_zone0/temp');
+
+        return {
+            cpuFreqMHz: toMHz(this.readSysfs(base + 'scaling_cur_freq')),
+            cpuFreqMinMHz: toMHz(this.readSysfs(base + 'scaling_min_freq')),
+            cpuFreqMaxMHz: toMHz(this.readSysfs(base + 'scaling_max_freq')),
+            cpuFreqHwMaxMHz: toMHz(this.readSysfs(base + 'cpuinfo_max_freq')),
+            cpuGovernor: this.readSysfs(base + 'scaling_governor'),
+            cpuTempC: (rawTemp === null ? null : Math.round(Number(rawTemp) / 1000)),
+        };
     }
 
 
