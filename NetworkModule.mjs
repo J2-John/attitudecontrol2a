@@ -40,6 +40,7 @@ const NETWORK_REQUEST_TIMEOUT_MS = 15000;  // number of milliseconds to wait bef
 const ENABLE_WEBSOCKET_TRANSPORT = true;
 const WS_CONNECT_TIMEOUT_MS = 5000;  // how long to wait for the WS handshake before giving up on this attempt
 const WS_RECONNECT_INTERVAL_MS = 30000;  // how often to retry connecting the WebSocket while on the HTTP fallback
+const WS_RESPONSE_TIMEOUT_MS = 10000;  // fail a WebSocket request if the gateway never answers
 
 const VERBOSE_LOGGING = false;
 
@@ -77,6 +78,7 @@ class NetworkModule {
         this.wsConnecting = false;
         this.wsReconnectTimer = null;
         this.pendingPayload = null;  // payload currently in flight over the WebSocket, awaiting a response message
+        this.wsResponseTimer = null;  // fails the in-flight WebSocket request if no response arrives
 
         // Initialize queue of objects that are pending to be sent to the server
         // these objects might be logs, current status objects, data from external devices, etc.
@@ -311,11 +313,44 @@ class NetworkModule {
     sendViaWebSocket(requestObject, payload) {
     	try {
     		this.pendingPayload = payload;
+
+    		// An open-but-unresponsive socket produces no transport error, so without this the
+    		// payload would be silently discarded when the next request overwrites pendingPayload.
+    		// Fail it explicitly instead, which re-queues the data and drops back to HTTP.
+    		this.clearWebSocketResponseTimer();
+    		this.wsResponseTimer = setTimeout(() => {
+    			this.wsResponseTimer = null;
+
+    			logger.warn('WebSocket request timed out with no response from the gateway. Falling back to HTTP.');
+
+    			// fails the pending payload back into the queue and schedules a reconnect
+    			this.handleWebSocketFailure();
+
+    			// drop the socket so the next tick picks HTTP
+    			if (this.ws) {
+    				try {
+    					this.ws.terminate();
+    				} catch (terminateError) {
+    					// already gone - nothing to do
+    				}
+    			}
+    		}, WS_RESPONSE_TIMEOUT_MS);
+
     		this.ws.send(JSON.stringify(requestObject));
     	} catch (error) {
+    		this.clearWebSocketResponseTimer();
     		this.pendingPayload = null;
     		this.onNetworkRequestError(payload, error);
     		this.handleWebSocketFailure();
+    	}
+    }
+
+
+    // cancel the in-flight WebSocket response timer, if one is running
+    clearWebSocketResponseTimer() {
+    	if (this.wsResponseTimer) {
+    		clearTimeout(this.wsResponseTimer);
+    		this.wsResponseTimer = null;
     	}
     }
 
@@ -442,7 +477,17 @@ class NetworkModule {
     	});
 
     	socket.on('message', (raw) => {
-    		const payload = this.pendingPayload || [];
+    		this.clearWebSocketResponseTimer();
+
+    		// Ignore unsolicited messages. The gateway is request/response only, and treating a
+    		// stray or duplicate message as a successful response would reset the error counter
+    		// and apply its body as device configuration.
+    		if (!this.pendingPayload) {
+    			logger.warn('Received a WebSocket message with no request pending. Ignoring it.');
+    			return;
+    		}
+
+    		const payload = this.pendingPayload;
     		this.pendingPayload = null;
     		this.onNetworkRequestSuccess(payload, raw.toString());
     	});
@@ -467,6 +512,8 @@ class NetworkModule {
     // request immediately (rather than waiting out the HTTP-style timeout) so
     // performNetworkRequest picks HTTP on its very next tick, and schedules a reconnect attempt.
     handleWebSocketFailure() {
+    	this.clearWebSocketResponseTimer();
+
     	if (this.pendingPayload) {
     		const payload = this.pendingPayload;
     		this.pendingPayload = null;
