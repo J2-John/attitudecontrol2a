@@ -1,3 +1,12 @@
+// ===== DELIBERATELY BROKEN BUILD - ROLLBACK TEST ONLY =====
+// This import points at a file that does not exist. It parses fine, so it
+// passes update.sh's `node --check`, then throws at runtime and puts the
+// process into a pm2 crash loop. That is exactly the failure update.sh v2
+// is supposed to detect and roll back from.
+// DO NOT MERGE THIS BRANCH.
+import './this-module-does-not-exist.mjs';
+// ==========================================================
+
 // AttitudeControl2A.js
 // primary JS app for Attitude Control firmware (2nd gen), version 2.A
 // copyright 2024 Drew Shipps, J Squared Systems
