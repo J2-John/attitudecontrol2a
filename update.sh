@@ -29,7 +29,10 @@ PARENT_DIR="$(dirname "$APP_DIR")"
 APP_BASENAME="$(basename "$APP_DIR")"
 
 PM2_APP_NAME="AttitudeControl2A"
-REPO_URL="https://github.com/DrewJSquared/attitudecontrol2a"
+# Canonical firmware repo. Override with the ATT_REPO_URL environment variable to
+# install from a fork - useful for canary testing a branch before it reaches main:
+#   ATT_REPO_URL=https://github.com/J2-John/attitudecontrol2a ./update.sh my-branch
+REPO_URL="${ATT_REPO_URL:-https://github.com/DrewJSquared/attitudecontrol2a}"
 BRANCH="${1:-main}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -47,19 +50,77 @@ log() {
 	echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"
 }
 
-# Read one process's state out of pm2. Prints: "<status> <restart_count>"
-pm2_state() {
-	pm2 jlist 2>/dev/null | node -e '
-		let s = "";
-		process.stdin.on("data", d => s += d).on("end", () => {
-			try {
-				const list = JSON.parse(s);
-				const p = list.find(x => x.name === process.argv[1]);
-				if (!p) { console.log("missing 0"); return; }
-				console.log(p.pm2_env.status, p.pm2_env.restart_time);
-			} catch (e) { console.log("unreadable 0"); }
-		});
-	' "$PM2_APP_NAME"
+# Watch the app across the whole settle window and decide whether it is working.
+#
+# Deliberately does NOT ask pm2 whether it is happy. pm2 reports a process as
+# "online" the moment it forks, before knowing whether it survived - observed on
+# 2026-08-08 reporting "online" with a single restart for a build that could not
+# load at all. Its status field and restart counter are both unreliable here.
+#
+# Two things are checked, and both are sampled continuously rather than once at
+# the end, because a single sample cannot tell a stable process from a respawned
+# one and cannot see a short-lived HTTP request that closed a moment earlier:
+#
+#   1. the PID never changes  - a crash-respawn gives a different pid
+#   2. we see the app talking to the server at least once on :443
+#
+# (2) is the property that actually matters. A device that can reach the server
+# can still be updated, so a bad build stays recoverable remotely. One that
+# cannot is a site visit. Both transports are covered: the WebSocket build holds
+# one connection open continuously, the HTTP build opens a short one every
+# second, and sampling across 90s catches either.
+app_pid() {
+	pm2 pid "$PM2_APP_NAME" 2>/dev/null | tr -d '[:space:]'
+}
+
+watch_and_check() {
+	local start_pid pid seen=0 samples=0 elapsed=0
+
+	start_pid="$(app_pid)"
+	case "$start_pid" in
+		''|*[!0-9]*)
+			log "health: pm2 gave no usable pid after restart ('$start_pid')"
+			return 1
+			;;
+	esac
+
+	while [ "$elapsed" -lt "$SETTLE_SECONDS" ]; do
+		sleep 3
+		elapsed=$((elapsed + 3))
+		samples=$((samples + 1))
+
+		pid="$(app_pid)"
+		case "$pid" in
+			''|*[!0-9]*)
+				log "health: no running process at t=${elapsed}s"
+				return 1
+				;;
+		esac
+
+		if [ "$pid" != "$start_pid" ]; then
+			log "health: pid changed $start_pid -> $pid at t=${elapsed}s (the app restarted)"
+			return 1
+		fi
+
+		if ! kill -0 "$pid" 2>/dev/null; then
+			log "health: pid $pid died at t=${elapsed}s"
+			return 1
+		fi
+
+		if ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ':443'; then
+			seen=$((seen + 1))
+		fi
+	done
+
+	if [ "$seen" -eq 0 ]; then
+		log "health: pid $pid stayed up ${SETTLE_SECONDS}s but was never seen contacting the server on :443"
+		log "health: sockets held by the app at this moment:"
+		ss -tanp 2>/dev/null | grep "pid=${start_pid}," | head -5 | while read -r l; do log "health:   $l"; done
+		return 1
+	fi
+
+	log "health: pid $pid stable for ${SETTLE_SECONDS}s, server contact on $seen of $samples samples"
+	return 0
 }
 
 abort() {
@@ -98,10 +159,43 @@ log "=== update start (branch=$BRANCH) ==="
 # ---------------------------------------------------------------------------
 # 1. Fetch and validate. Nothing live is touched in this section.
 # ---------------------------------------------------------------------------
+# ss is used by the health check below. If it is unavailable we cannot tell a
+# working install from a dead one, so stop before changing anything.
+command -v ss >/dev/null 2>&1 || abort "ss (iproute2) not found - cannot verify device health"
+
 mkdir -p "$WORK" || abort "cannot create work dir $WORK"
 
-if ! curl -fSL --max-time 300 -o "$WORK/src.zip" "$REPO_URL/archive/refs/heads/$BRANCH.zip"; then
-	abort "download failed"
+# GitHub's archive endpoint rate-limits unauthenticated requests and answers with
+# 404 when it does - indistinguishable from a branch that does not exist. Observed
+# 2026-08-08 after roughly six pulls in twenty minutes from one IP. Several devices
+# at one site share a public IP, so this is a fleet-scale concern, not a lab quirk.
+# Retry with backoff rather than abandoning the update on a transient refusal.
+ZIP_URL="$REPO_URL/archive/refs/heads/$BRANCH.zip"
+log "fetching $ZIP_URL"
+
+fetch_attempt=1
+fetch_max=4
+fetch_delay=10
+fetch_ok=0
+
+while [ "$fetch_attempt" -le "$fetch_max" ]; do
+	if curl -fsSL --max-time 300 -o "$WORK/src.zip" "$ZIP_URL"; then
+		fetch_ok=1
+		break
+	fi
+
+	log "download attempt $fetch_attempt of $fetch_max failed"
+
+	if [ "$fetch_attempt" -lt "$fetch_max" ]; then
+		sleep "$fetch_delay"
+		fetch_delay=$((fetch_delay * 2))
+	fi
+
+	fetch_attempt=$((fetch_attempt + 1))
+done
+
+if [ "$fetch_ok" -ne 1 ]; then
+	abort "download failed after $fetch_max attempts"
 fi
 
 if ! unzip -q "$WORK/src.zip" -d "$WORK/unz"; then
@@ -138,8 +232,6 @@ cp -p "$APP_DIR/config.json" "$SNAPSHOT/config.json" 2>/dev/null
 
 log "snapshot created: $SNAPSHOT"
 
-BEFORE_RESTARTS="$(pm2_state | awk '{print $2}')"
-
 # ---------------------------------------------------------------------------
 # 3. Install and restart.
 # ---------------------------------------------------------------------------
@@ -157,17 +249,9 @@ fi
 #    it is the one that costs a site visit.
 # ---------------------------------------------------------------------------
 log "restarted - watching for ${SETTLE_SECONDS}s"
-sleep "$SETTLE_SECONDS"
 
-read -r STATUS AFTER_RESTARTS <<< "$(pm2_state)"
-
-if [ "$STATUS" != "online" ]; then
-	rollback "process is '$STATUS' after ${SETTLE_SECONDS}s"
-fi
-
-# One restart is the one we asked for. More than that means it is crash looping.
-if [ "$((AFTER_RESTARTS - BEFORE_RESTARTS))" -gt 1 ]; then
-	rollback "process restarted $((AFTER_RESTARTS - BEFORE_RESTARTS)) times in ${SETTLE_SECONDS}s"
+if ! watch_and_check; then
+	rollback "new build failed the health check"
 fi
 
 # config.json must survive the update. It is gitignored so rsync never ships one,
