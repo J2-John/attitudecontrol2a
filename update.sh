@@ -219,33 +219,46 @@ mkdir -p "$WORK" || abort "cannot create work dir $WORK"
 ZIP_URL="$REPO_URL/archive/refs/heads/$BRANCH.zip"
 log "fetching $ZIP_URL"
 
-fetch_attempt=1
+# The unzip is inside this loop deliberately. A truncated or corrupt archive is exactly
+# the kind of transient failure retrying fixes, and treating it as fatal - as the first
+# version of this did - turns a blip into a device that never updates. Observed in the
+# field 2026-08-09: "zip is corrupt or incomplete" after curl reported success.
+CUR_VERSION="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+
 fetch_max=4
 fetch_delay=10
 fetch_ok=0
+ZIP_BYTES=0
 
-while [ "$fetch_attempt" -le "$fetch_max" ]; do
-	if curl -fsSL --max-time 300 -o "$WORK/src.zip" "$ZIP_URL"; then
-		fetch_ok=1
-		break
+for fetch_attempt in $(seq 1 "$fetch_max"); do
+	# start each attempt from nothing, so a partial unpack cannot be mistaken for a good one
+	rm -rf "$WORK/unz" "$WORK/src.zip"
+
+	if ! curl -fsSL --max-time 300 -o "$WORK/src.zip" "$ZIP_URL"; then
+		log "attempt $fetch_attempt/$fetch_max: download failed"
+	else
+		# recorded before validation, so an abort can say what actually arrived
+		ZIP_BYTES="$(stat -c %s "$WORK/src.zip" 2>/dev/null || echo 0)"
+		SRC_SHA="$(sha256sum "$WORK/src.zip" 2>/dev/null | cut -c1-12)"
+
+		if unzip -q "$WORK/src.zip" -d "$WORK/unz"; then
+			fetch_ok=1
+			break
+		fi
+
+		log "attempt $fetch_attempt/$fetch_max: archive did not unpack (bytes=$ZIP_BYTES sha=$SRC_SHA)"
 	fi
-
-	log "download attempt $fetch_attempt of $fetch_max failed"
 
 	if [ "$fetch_attempt" -lt "$fetch_max" ]; then
 		sleep "$fetch_delay"
 		fetch_delay=$((fetch_delay * 2))
 	fi
-
-	fetch_attempt=$((fetch_attempt + 1))
 done
 
 if [ "$fetch_ok" -ne 1 ]; then
-	abort "download failed after $fetch_max attempts"
-fi
-
-if ! unzip -q "$WORK/src.zip" -d "$WORK/unz"; then
-	abort "zip is corrupt or incomplete"
+	# include free space: a full /tmp produces a corrupt-archive symptom, and with no SSH
+	# into field devices this line may be the only way anyone ever finds that out
+	abort "no usable archive after $fetch_max attempts (bytes=$ZIP_BYTES sha=${SRC_SHA:-none} tmpfreeMB=$(df -Pm /tmp 2>/dev/null | awk 'NR==2{print $4}') rootfreeMB=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}'))"
 fi
 
 SRC="$(find "$WORK/unz" -mindepth 1 -maxdepth 1 -type d | head -1)"
@@ -259,11 +272,9 @@ if ! node --check "$SRC/AttitudeControl2A.js" 2>/dev/null; then
 	abort "downloaded entrypoint does not parse"
 fi
 
-SRC_SHA="$(sha256sum "$WORK/src.zip" 2>/dev/null | cut -c1-12)"
-CUR_VERSION="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
 NEW_VERSION="$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null)"
 
-log "download validated ($(du -sh "$SRC" | cut -f1)) version ${CUR_VERSION:-unknown} -> ${NEW_VERSION:-unknown} sha ${SRC_SHA:-unknown}"
+log "download validated (${ZIP_BYTES} bytes, sha ${SRC_SHA:-unknown}) version ${CUR_VERSION:-unknown} -> ${NEW_VERSION:-unknown}"
 
 # ---------------------------------------------------------------------------
 # 2. Snapshot the current install. Hardlinks, so this is fast and cheap.
