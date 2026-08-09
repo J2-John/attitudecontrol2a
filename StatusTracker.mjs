@@ -76,6 +76,13 @@ class StatusTracker {
             const cpuStatus = this.readCpuStatus();
             const thermal = this.readThermalDetail();
 
+            // which build is actually running, and how the last update attempt ended.
+            // added 2026-08: with ~200 devices across several build generations there was no
+            // way to answer 'what is deployed where', and a silent rollback looked identical
+            // to a successful update.
+            const firmwareVersion = this.readTextFile('./VERSION');
+            const lastUpdate = this.readLastUpdate();
+
             // create an object with the current system status in it
             const currentSystemStatus = {
                 timestamp: new Date(),
@@ -110,6 +117,9 @@ class StatusTracker {
                 diskUsage: 'unknown',
 
                 networkInterfaces: os.networkInterfaces(),
+
+                firmwareVersion: firmwareVersion,
+                lastUpdate: lastUpdate,
             };
 
             // TEMP log the current system status object
@@ -135,10 +145,32 @@ class StatusTracker {
     // helper to read a single sysfs value. returns null if the file is missing or unreadable,
     // which is the normal case on macOS during development or on a board without cpufreq exposed.
     readSysfs(path) {
+        return this.readTextFile(path);
+    }
+
+
+    // read any small text file, returning a trimmed string or null. Never throws.
+    readTextFile(path) {
         try {
             return fs.readFileSync(path, 'utf8').trim();
         } catch (error) {
             return null;
+        }
+    }
+
+
+    // read the record update.sh leaves behind. Lives outside the app directory so a
+    // rollback's rsync --delete cannot erase the evidence that a rollback happened.
+    // Returns null on a device that has never run the new updater.
+    readLastUpdate() {
+        const raw = this.readTextFile(os.homedir() + '/attitude-build.json');
+        if (raw === null) { return null; }
+
+        try {
+            return JSON.parse(raw);
+        } catch (error) {
+            // a truncated or malformed file should not cost us the whole status cycle
+            return { outcome: 'unreadable' };
         }
     }
 
