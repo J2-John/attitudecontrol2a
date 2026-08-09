@@ -40,6 +40,18 @@ SNAPSHOT="$PARENT_DIR/${APP_BASENAME}.rollback-$STAMP"
 WORK="/tmp/attitude-update-$$"
 LOG="/home/attitude/attitude-update.log"
 
+# Written on every terminal path - success, abort, and rollback - and read back by
+# StatusTracker, which reports it to the server on the normal status cycle. Deliberately
+# OUTSIDE the app directory: rsync --delete during a rollback would otherwise wipe the very
+# record that says a rollback happened.
+BUILD_STATE="${HOME:-/home/attitude}/attitude-build.json"
+
+# Populated as we go. Declared up front because 'set -u' is on and the abort path can fire
+# before any of them are known.
+CUR_VERSION=""
+NEW_VERSION=""
+SRC_SHA=""
+
 # Do not hold the app directory as our working directory - it gets rewritten below.
 cd / || exit 1
 
@@ -123,8 +135,41 @@ watch_and_check() {
 	return 0
 }
 
+# Strip anything that would break the JSON below. These strings are ours, not user input,
+# but a stray quote in a failure message should not produce a file the device cannot parse.
+json_escape() {
+	printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '
+}
+
+
+# Record what happened, so the fleet operator can see it without SSH into the device.
+# A silent rollback is indistinguishable from a successful update, which is exactly the
+# ambiguity this removes.
+write_build_state() {
+	local outcome="$1"
+	local detail="$2"
+	local installed
+
+	installed="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+
+	cat > "$BUILD_STATE" 2>/dev/null <<EOF || true
+{
+  "outcome": "$(json_escape "$outcome")",
+  "detail": "$(json_escape "$detail")",
+  "branch": "$(json_escape "$BRANCH")",
+  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "fromVersion": "$(json_escape "$CUR_VERSION")",
+  "toVersion": "$(json_escape "$NEW_VERSION")",
+  "installedVersion": "$(json_escape "$installed")",
+  "sourceSha256": "$(json_escape "$SRC_SHA")"
+}
+EOF
+}
+
+
 abort() {
 	log "ABORTED: $* (live install untouched)"
+	write_build_state "aborted" "$*"
 	rm -rf "$WORK"
 	exit 1
 }
@@ -150,6 +195,7 @@ rollback() {
 
 	pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1
 	log "rollback complete - restored from $SNAPSHOT"
+	write_build_state "rolled-back" "$*"
 	rm -rf "$WORK"
 	exit 2
 }
@@ -213,7 +259,11 @@ if ! node --check "$SRC/AttitudeControl2A.js" 2>/dev/null; then
 	abort "downloaded entrypoint does not parse"
 fi
 
-log "download validated ($(du -sh "$SRC" | cut -f1))"
+SRC_SHA="$(sha256sum "$WORK/src.zip" 2>/dev/null | cut -c1-12)"
+CUR_VERSION="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+NEW_VERSION="$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null)"
+
+log "download validated ($(du -sh "$SRC" | cut -f1)) version ${CUR_VERSION:-unknown} -> ${NEW_VERSION:-unknown} sha ${SRC_SHA:-unknown}"
 
 # ---------------------------------------------------------------------------
 # 2. Snapshot the current install. Hardlinks, so this is fast and cheap.
@@ -273,5 +323,7 @@ ls -1dt "$PARENT_DIR/${APP_BASENAME}.rollback-"* 2>/dev/null \
 	| xargs -r rm -rf
 
 rm -rf "$WORK"
-log "=== update complete (branch=$BRANCH) ==="
+write_build_state "updated" "installed ${NEW_VERSION:-unknown} from $BRANCH"
+
+log "=== update complete (branch=$BRANCH, version=${NEW_VERSION:-unknown}) ==="
 exit 0
