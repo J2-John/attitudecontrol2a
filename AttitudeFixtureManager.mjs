@@ -62,6 +62,7 @@ class AttitudeFixtureManager {
 		this.perfLastFrameStart = 0;
 		this.perfMaxFrameMs = 0;
 		this.perfMaxGapMs = 0;
+		this.perfSumFrameMs = 0;
 		this.perfSummary = '';
 	}
 
@@ -177,6 +178,7 @@ class AttitudeFixtureManager {
     		const frameMs = now - frameStart;
 
     		if (frameMs > this.perfMaxFrameMs) { this.perfMaxFrameMs = frameMs; }
+    		this.perfSumFrameMs += frameMs;
     		this.perfFrames++;
 
     		// first frame after boot: start the window here rather than counting a partial one
@@ -185,6 +187,7 @@ class AttitudeFixtureManager {
     			this.perfFrames = 0;
     			this.perfMaxFrameMs = 0;
     			this.perfMaxGapMs = 0;
+    			this.perfSumFrameMs = 0;
     			return;
     		}
 
@@ -196,17 +199,26 @@ class AttitudeFixtureManager {
     		// device is not keeping up.
     		const fps = (this.perfFrames * 1000) / windowMs;
 
+    		// avgframe is the honest measure of how much work a config costs; maxframe alone
+    		// cannot distinguish a steady load from one bad spike in ten seconds.
+    		const avgFrameMs = this.perfSumFrameMs / this.perfFrames;
+
+    		// NOTE: the populated properties are this.fixtures / this.zones, set in
+    		// getConfigration(). The fixturesList / zonesList declared in the constructor are
+    		// never written to.
     		this.perfSummary = 'fps=' + fps.toFixed(1)
+    			+ ' avgframe=' + avgFrameMs.toFixed(2) + 'ms'
     			+ ' maxframe=' + this.perfMaxFrameMs.toFixed(1) + 'ms'
     			+ ' maxgap=' + this.perfMaxGapMs.toFixed(1) + 'ms'
     			+ ' engines=' + this.engineInstances.length
-    			+ ' fixtures=' + (this.fixturesList ? this.fixturesList.length : 0)
-    			+ ' zones=' + (this.zonesList ? this.zonesList.length : 0);
+    			+ ' fixtures=' + (this.fixtures ? this.fixtures.length : 0)
+    			+ ' zones=' + (this.zones ? this.zones.length : 0);
 
     		this.perfFrames = 0;
     		this.perfWindowStart = now;
     		this.perfMaxFrameMs = 0;
     		this.perfMaxGapMs = 0;
+    		this.perfSumFrameMs = 0;
     	} catch (error) {
     		// deliberately silent - a broken counter is not worth a log line every 25ms
     	}
