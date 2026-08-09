@@ -55,7 +55,17 @@ SRC_SHA=""
 # Do not hold the app directory as our working directory - it gets rewritten below.
 cd / || exit 1
 
-SETTLE_SECONDS=90     # how long the new build must stay up before we trust it
+# A fixed watch window was biased against exactly the devices that most need updating.
+# AC-0020047 runs at 100MHz of 1512 - roughly a fifteenth of a healthy device - so Node
+# takes far longer there to boot, load config, start eight modules and open a socket. A flat
+# 90s window timed it out mid-startup and rolled back a perfectly good build, which would
+# have left every throttled device in the fleet permanently on old firmware.
+#
+# So: pass as soon as the build has proved itself, but wait a lot longer before giving up.
+# A real crash loop still fails in seconds, because that is detected by the pid changing
+# rather than by the clock running out.
+MIN_STABLE_SECONDS=60    # must be up at least this long, and seen talking to the server
+MAX_WATCH_SECONDS=240    # ...but wait up to this long for a slow device to get there
 KEEP_SNAPSHOTS=2      # older rollback snapshots are pruned to save SD space
 
 log() {
@@ -96,7 +106,7 @@ watch_and_check() {
 			;;
 	esac
 
-	while [ "$elapsed" -lt "$SETTLE_SECONDS" ]; do
+	while [ "$elapsed" -lt "$MAX_WATCH_SECONDS" ]; do
 		sleep 3
 		elapsed=$((elapsed + 3))
 		samples=$((samples + 1))
@@ -122,48 +132,20 @@ watch_and_check() {
 		if ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ':443'; then
 			seen=$((seen + 1))
 		fi
+
+		# Early exit. Once the process has held together for MIN_STABLE_SECONDS and we have
+		# actually watched it reach the server, there is nothing further to learn by waiting -
+		# and on a healthy device this finishes sooner than the old fixed window did.
+		if [ "$elapsed" -ge "$MIN_STABLE_SECONDS" ] && [ "$seen" -gt 0 ]; then
+			log "health: pid $pid stable ${elapsed}s, server contact on $seen of $samples samples"
+			return 0
+		fi
 	done
 
-	if [ "$seen" -eq 0 ]; then
-		log "health: pid $pid stayed up ${SETTLE_SECONDS}s but was never seen contacting the server on :443"
-		log "health: sockets held by the app at this moment:"
-		ss -tanp 2>/dev/null | grep "pid=${start_pid}," | head -5 | while read -r l; do log "health:   $l"; done
-		return 1
-	fi
-
-	log "health: pid $pid stable for ${SETTLE_SECONDS}s, server contact on $seen of $samples samples"
-	return 0
-}
-
-# Strip anything that would break the JSON below. These strings are ours, not user input,
-# but a stray quote in a failure message should not produce a file the device cannot parse.
-json_escape() {
-	printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '
-}
-
-
-# Record what happened, so the fleet operator can see it without SSH into the device.
-# A silent rollback is indistinguishable from a successful update, which is exactly the
-# ambiguity this removes.
-write_build_state() {
-	local outcome="$1"
-	local detail="$2"
-	local installed
-
-	installed="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
-
-	cat > "$BUILD_STATE" 2>/dev/null <<EOF || true
-{
-  "outcome": "$(json_escape "$outcome")",
-  "detail": "$(json_escape "$detail")",
-  "branch": "$(json_escape "$BRANCH")",
-  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "fromVersion": "$(json_escape "$CUR_VERSION")",
-  "toVersion": "$(json_escape "$NEW_VERSION")",
-  "installedVersion": "$(json_escape "$installed")",
-  "sourceSha256": "$(json_escape "$SRC_SHA")"
-}
-EOF
+	log "health: pid $pid stayed up ${MAX_WATCH_SECONDS}s but never reached the server on :443"
+	log "health: cpu $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo '?') of $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo '?') kHz"
+	ss -tanp 2>/dev/null | grep "pid=${start_pid}," | head -5 | while read -r l; do log "health:   $l"; done
+	return 1
 }
 
 
@@ -199,6 +181,16 @@ rollback() {
 	rm -rf "$WORK"
 	exit 2
 }
+
+# Only one updater at a time. The macro handshake re-arms the update flag on failure with
+# no cap, so a second run can start while the first is still installing - two processes
+# snapshotting and rsyncing the same directory produces silent, unreproducible corruption.
+LOCK_FILE="${HOME:-/home/attitude}/.attitude-update.lock"
+exec 9>"$LOCK_FILE" 2>/dev/null || true
+if ! flock -n 9 2>/dev/null; then
+	log "another update is already running - exiting without changes"
+	exit 3
+fi
 
 log "=== update start (branch=$BRANCH) ==="
 
@@ -309,7 +301,7 @@ fi
 # 4. Health check. A crash loop is the failure mode that matters most, because
 #    it is the one that costs a site visit.
 # ---------------------------------------------------------------------------
-log "restarted - watching for ${SETTLE_SECONDS}s"
+log "restarted - watching (pass at ${MIN_STABLE_SECONDS}s, give up at ${MAX_WATCH_SECONDS}s)"
 
 if ! watch_and_check; then
 	rollback "new build failed the health check"
