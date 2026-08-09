@@ -252,6 +252,12 @@ class NetworkModule {
     		device_id: idManager.getId(),
     		serialnumber: idManager.getSerialNumber(),
     		payload: payload,
+
+    		// Fingerprint of the configuration we are currently holding. If it matches what the
+    		// server has, the response comes back without the configuration in it - which is the
+    		// overwhelming majority of syncs. ConfigManager.update() merges only the keys present
+    		// in a response, so a reply that omits the config leaves ours untouched.
+    		configHash: configManager.getConfigHash(),
     	};
 
     	// log the entire request object

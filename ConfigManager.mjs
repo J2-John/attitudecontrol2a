@@ -31,11 +31,6 @@ class ConfigManager {
 		this.config = {};
 		this.filePath = CONFIG_FILE_PATH + 'config.json';
 
-		// the exact string we last wrote to disk. used to skip writes when nothing changed -
-		// the server sends a full config on every sync, so without this the whole file was
-		// rewritten once per second (~4.5 GB/day of SD card wear) even when identical.
-		this.lastWrittenSerialized = null;
-
 		// log levels
 		this.logLevels = ['none', 'minimal', 'interval', 'detail'];
 	}
@@ -59,10 +54,6 @@ class ConfigManager {
 
 			// replace current config with the data from the file
 			this.config = JSON.parse(rawData);
-
-			// seed the write guard with the normalized form of what's already on disk,
-			// so an unchanged config after boot doesn't trigger a pointless rewrite
-			this.lastWrittenSerialized = JSON.stringify(this.config, null, 2);
 
 			// log success
 			logger.info('Successfully loaded configuration data from local JSON file!');
@@ -98,29 +89,8 @@ class ConfigManager {
 				logger.info('Saving configuration to file...');
 			}
 
-			// serialize once, then skip the write entirely if it matches what's already
-			// on disk. the server sends the full config every sync, so the overwhelming
-			// majority of these calls are writing byte-identical data.
-			const serialized = JSON.stringify(this.config, null, 2);
-
-			if (serialized === this.lastWrittenSerialized) {
-				// nothing changed - don't touch the SD card
-				if (this.checkLogLevel('detail')) {
-					logger.info('Configuration unchanged, skipping write to file.');
-				}
-
-				return;
-			}
-
-			// write to a temporary file first, then rename over the real one. rename is
-			// atomic, so losing power mid-write can't leave a truncated config.json that
-			// fails to parse on next boot.
-			const tempPath = this.filePath + '.tmp';
-			fs.writeFileSync(tempPath, serialized);
-			fs.renameSync(tempPath, this.filePath);
-
-			// only record it as written after both steps succeeded
-			this.lastWrittenSerialized = serialized;
+			// actually write the config to a file
+			fs.writeFileSync(this.filePath, JSON.stringify(this.config, null, 2));
 
 			// log success
 			if (this.checkLogLevel('detail')) {
@@ -339,6 +309,15 @@ class ConfigManager {
 	}
 
 
+
+
+	// the fingerprint of the config the server last sent us. Echoed back on every sync so the
+	// server can answer "nothing changed" in a few hundred bytes instead of resending the
+	// whole configuration. Null on a device that has never received one, which makes the
+	// server send everything - so a device with no hash is always correct, just chattier.
+	getConfigHash() {
+		return this.config?.configHash ?? null;
+	}
 
 
 	// get the config file path

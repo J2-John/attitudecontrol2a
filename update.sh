@@ -149,6 +149,44 @@ watch_and_check() {
 }
 
 
+# Strip anything that would break the JSON below. These strings are ours, not user input,
+# but a stray quote in a failure message should not produce a file the device cannot parse.
+json_escape() {
+	printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '
+}
+
+
+# Record what happened, so the fleet operator can see it without SSH into the device.
+# A silent rollback is indistinguishable from a successful update, which is exactly the
+# ambiguity this removes.
+write_build_state() {
+	local outcome="$1"
+	local detail="$2"
+	local installed
+	local tail_lines
+
+	installed="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+
+	# Last few log lines travel with the state. With no SSH into field devices this is often
+	# the only way anyone will ever see why something failed.
+	tail_lines="$(tail -n 4 "$LOG" 2>/dev/null | tr '\n' '|')"
+
+	cat > "$BUILD_STATE" 2>/dev/null <<EOF || true
+{
+  "outcome": "$(json_escape "$outcome")",
+  "detail": "$(json_escape "$detail")",
+  "branch": "$(json_escape "$BRANCH")",
+  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "fromVersion": "$(json_escape "$CUR_VERSION")",
+  "toVersion": "$(json_escape "$NEW_VERSION")",
+  "installedVersion": "$(json_escape "$installed")",
+  "sourceSha256": "$(json_escape "$SRC_SHA")",
+  "log": "$(json_escape "$tail_lines")"
+}
+EOF
+}
+
+
 abort() {
 	log "ABORTED: $* (live install untouched)"
 	write_build_state "aborted" "$*"
@@ -188,8 +226,11 @@ rollback() {
 LOCK_FILE="${HOME:-/home/attitude}/.attitude-update.lock"
 exec 9>"$LOCK_FILE" 2>/dev/null || true
 if ! flock -n 9 2>/dev/null; then
-	log "another update is already running - exiting without changes"
-	exit 3
+	# Exit 0, not an error. The macro handshake treats a non-zero exit as failure and re-arms
+	# the update flag, so exiting non-zero here made a harmless collision look like a failed
+	# update and started a retry loop on devices that were already current.
+	log "another update is already running - nothing to do"
+	exit 0
 fi
 
 log "=== update start (branch=$BRANCH) ==="
@@ -266,6 +307,17 @@ fi
 
 NEW_VERSION="$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null)"
 
+# Nothing to do if we already have this version. Without this the updater downloads,
+# snapshots, rsyncs and restarts in order to arrive exactly where it started - and combined
+# with a re-armed flag that became a permanent loop on already-current devices. Set
+# ATT_FORCE=1 to reinstall the same version deliberately.
+if [ -n "$CUR_VERSION" ] && [ "$CUR_VERSION" = "$NEW_VERSION" ] && [ "${ATT_FORCE:-0}" != "1" ]; then
+	log "already on ${CUR_VERSION} - nothing to do"
+	write_build_state "already-current" "already on ${CUR_VERSION}"
+	rm -rf "$WORK"
+	exit 0
+fi
+
 log "download validated (${ZIP_BYTES} bytes, sha ${SRC_SHA:-unknown}) version ${CUR_VERSION:-unknown} -> ${NEW_VERSION:-unknown}"
 
 # ---------------------------------------------------------------------------
@@ -293,8 +345,21 @@ if ! rsync -a "$SRC/" "$APP_DIR/"; then
 fi
 log "files installed"
 
-if ! pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1; then
-	rollback "pm2 restart failed"
+# pm2 is itself a Node CLI. On a device throttled to 100MHz of 1512 it can take many seconds
+# to start, and a single non-zero return rolled back a perfectly good build on AC-0020001.
+restart_ok=0
+for restart_attempt in 1 2 3; do
+	if pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1; then
+		restart_ok=1
+		break
+	fi
+
+	log "pm2 restart attempt $restart_attempt of 3 failed"
+	sleep 5
+done
+
+if [ "$restart_ok" -ne 1 ]; then
+	rollback "pm2 restart failed after 3 attempts"
 fi
 
 # ---------------------------------------------------------------------------
