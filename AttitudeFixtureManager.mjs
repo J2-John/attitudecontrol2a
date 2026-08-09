@@ -29,10 +29,17 @@ import { TRANSITIONS } from './Transitions.js';
 const DMX_FRAME_INTERVAL = 25;  // interval speed in milliseconds for each DMX frame (should be 25ms)
 const GAMMA = 1.7;
 
-// How often the frame-rate summary is recomputed. The summary string is attached to the
-// module status this class already emits every frame, so this only controls how often the
-// numbers refresh - it adds no extra traffic.
-const PERF_WINDOW_MS = 10000;
+
+// ==================== TEMPORARY PERFORMANCE INSTRUMENTATION ====================
+// Added 2026-08 to diagnose low frame rates. Times each phase of processFixtures and
+// reports a rolling 1-second summary through the existing moduleStatus channel.
+// ADDITIVE ONLY - no behaviour is changed. Remove once the cause is identified.
+if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+const PERF = {
+    frames: 0, cfg: 0n, uniq: 0n, gen: 0n, eng: 0n, patch: 0n,
+    total: 0n, maxTotal: 0n, windowStart: 0n, lastCall: 0n, maxGap: 0n,
+    report: 'PERF warming up...'
+};
 
 
 
@@ -53,17 +60,6 @@ class AttitudeFixtureManager {
 
 		// variable to hold the processFixtures interval ID
 		this.processFixturesInterval;
-
-		// ---- frame timing ----
-		// Plain numbers updated in place; nothing here allocates per frame. Rolled up into
-		// perfSummary once every PERF_WINDOW_MS and reported via the existing module status.
-		this.perfFrames = 0;
-		this.perfWindowStart = 0;
-		this.perfLastFrameStart = 0;
-		this.perfMaxFrameMs = 0;
-		this.perfMaxGapMs = 0;
-		this.perfSumFrameMs = 0;
-		this.perfSummary = '';
 	}
 
 
@@ -89,36 +85,73 @@ class AttitudeFixtureManager {
     // processFixtures - master function that runs every 25ms to process fixtures/shows/schedule,
     // run engine, then send values to sACN/DMX
     processFixtures() {
-    	// Stamp the start of the frame before any work. The gap since the previous frame
-    	// start is how we see the render loop being starved by something else on the thread -
-    	// a large maxgap with a small maxframe means this function is fine and is simply not
-    	// being called on time.
-    	const frameStart = performance.now();
-
-    	if (this.perfLastFrameStart) {
-    		const gapMs = frameStart - this.perfLastFrameStart;
-    		if (gapMs > this.perfMaxGapMs) { this.perfMaxGapMs = gapMs; }
-    	}
-    	this.perfLastFrameStart = frameStart;
-
     	// try to process fixtures
     	try {
     		// check if we are assigned to a location or not
     		if (configManager.getAssignedToLocation()) {
 	    		// get fixtures/zones/shows configManager and schedule from attitudeScheduler
+	        	const _t0 = process.hrtime.bigint();
+	        	if (PERF.lastCall !== 0n) {
+	        		const _gap = _t0 - PERF.lastCall;
+	        		if (_gap > PERF.maxGap) { PERF.maxGap = _gap; }
+	        	}
+	        	PERF.lastCall = _t0;
+
 	        	this.getConfigration();
+	        	const _t1 = process.hrtime.bigint();
 
 	        	// find unique show IDs in schedule
 				this.uniqueShowIds = this.findUniqueNumbers(this.schedule);
+				const _t2 = process.hrtime.bigint();
 
 				// generate/remove engine instances if needed
 				this.generateEngineInstances();
+				const _t3 = process.hrtime.bigint();
 
 				// process each engine instance, updating engine config if necesary and running engine
 				this.processEngineInstances();
+				const _t4 = process.hrtime.bigint();
 
 	        	// process the patch and schedule, then grab the output data from the engine and apply it to DMX
 	        	this.processPatchAndOutputShows();
+	        	const _t5 = process.hrtime.bigint();
+
+	        	PERF.frames++;
+	        	PERF.cfg += (_t1 - _t0);
+	        	PERF.uniq += (_t2 - _t1);
+	        	PERF.gen += (_t3 - _t2);
+	        	PERF.eng += (_t4 - _t3);
+	        	PERF.patch += (_t5 - _t4);
+	        	const _tot = _t5 - _t0;
+	        	PERF.total += _tot;
+	        	if (_tot > PERF.maxTotal) { PERF.maxTotal = _tot; }
+	        	if (PERF.windowStart === 0n) { PERF.windowStart = _t0; }
+	        	if ((_t5 - PERF.windowStart) >= 1000000000n) {
+	        		const _n = BigInt(PERF.frames || 1);
+	        		const _avg = function (v) { return (Number(v / _n) / 1e6).toFixed(2); };
+	        		PERF.report = 'PERF renderfps=' + PERF.frames
+	        			+ ' cfg=' + _avg(PERF.cfg)
+	        			+ ' uniq=' + _avg(PERF.uniq)
+	        			+ ' gen=' + _avg(PERF.gen)
+	        			+ ' eng=' + _avg(PERF.eng)
+	        			+ ' patch=' + _avg(PERF.patch)
+	        			+ ' total=' + _avg(PERF.total)
+	        			+ ' maxframe=' + (Number(PERF.maxTotal) / 1e6).toFixed(2)
+	        			+ ' maxgap=' + (Number(PERF.maxGap) / 1e6).toFixed(1)
+	        			+ ' engines=' + this.engineInstances.length
+	        			+ ' segs=' + (this.fixtures ? this.fixtures.length : 0)
+	        			+ ' udp=' + globalThis.__ATTPERF.udpPackets
+	        			+ ' udpkb=' + (globalThis.__ATTPERF.udpBytes / 1024).toFixed(1)
+	        			+ ' sched=' + globalThis.__ATTPERF.schedCalls
+	        			+ ' schedms=' + (Number(globalThis.__ATTPERF.schedNs) / 1e6).toFixed(1)
+	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers;
+	        		globalThis.__ATTPERF.udpPackets = 0; globalThis.__ATTPERF.udpBytes = 0;
+	        		globalThis.__ATTPERF.schedCalls = 0; globalThis.__ATTPERF.schedNs = 0n;
+	        		globalThis.__ATTPERF.senseTriggers = 0;
+	        		PERF.frames = 0; PERF.cfg = 0n; PERF.uniq = 0n; PERF.gen = 0n;
+	        		PERF.eng = 0n; PERF.patch = 0n; PERF.total = 0n;
+	        		PERF.maxTotal = 0n; PERF.maxGap = 0n; PERF.windowStart = _t5;
+	        	}
 
 	    		// log the interval
 	    		if (configManager.checkLogLevel('detail')) {
@@ -129,7 +162,7 @@ class AttitudeFixtureManager {
 		        eventHub.emit('moduleStatus', { 
 		            name: 'AttitudeFixtureManager', 
 		            status: 'operational',
-		            data: this.perfSummary || 'Processed fixtures/shows/schedule and sent DMX to AttitudeSACN module!',
+		            data: PERF.report,
 		        });
 		    } else {
 		    	// otherwise we aren't assigned to a location, so set everything to white
@@ -161,67 +194,7 @@ class AttitudeFixtureManager {
 	            status: 'errored',
 	            data: `Error processing fixtures: ${error}`,
 	        });
-        } finally {
-        	// count the frame whether or not it succeeded - a frame that threw still consumed
-        	// time, and excluding failures would flatter the numbers exactly when they matter
-        	this.recordFrame(frameStart);
         }
-    }
-
-
-    // recordFrame - fold one frame into the running totals, and roll them up into a summary
-    // string once per window. Wrapped in its own try/catch: telemetry must never be the
-    // reason a device stops rendering.
-    recordFrame(frameStart) {
-    	try {
-    		const now = performance.now();
-    		const frameMs = now - frameStart;
-
-    		if (frameMs > this.perfMaxFrameMs) { this.perfMaxFrameMs = frameMs; }
-    		this.perfSumFrameMs += frameMs;
-    		this.perfFrames++;
-
-    		// first frame after boot: start the window here rather than counting a partial one
-    		if (!this.perfWindowStart) {
-    			this.perfWindowStart = now;
-    			this.perfFrames = 0;
-    			this.perfMaxFrameMs = 0;
-    			this.perfMaxGapMs = 0;
-    			this.perfSumFrameMs = 0;
-    			return;
-    		}
-
-    		const windowMs = now - this.perfWindowStart;
-    		if (windowMs < PERF_WINDOW_MS) { return; }
-
-    		// fps is measured, not assumed - frames actually completed divided by real elapsed
-    		// time. The interval is set to 25ms (40fps); anything well below that means the
-    		// device is not keeping up.
-    		const fps = (this.perfFrames * 1000) / windowMs;
-
-    		// avgframe is the honest measure of how much work a config costs; maxframe alone
-    		// cannot distinguish a steady load from one bad spike in ten seconds.
-    		const avgFrameMs = this.perfSumFrameMs / this.perfFrames;
-
-    		// NOTE: the populated properties are this.fixtures / this.zones, set in
-    		// getConfigration(). The fixturesList / zonesList declared in the constructor are
-    		// never written to.
-    		this.perfSummary = 'fps=' + fps.toFixed(1)
-    			+ ' avgframe=' + avgFrameMs.toFixed(2) + 'ms'
-    			+ ' maxframe=' + this.perfMaxFrameMs.toFixed(1) + 'ms'
-    			+ ' maxgap=' + this.perfMaxGapMs.toFixed(1) + 'ms'
-    			+ ' engines=' + this.engineInstances.length
-    			+ ' fixtures=' + (this.fixtures ? this.fixtures.length : 0)
-    			+ ' zones=' + (this.zones ? this.zones.length : 0);
-
-    		this.perfFrames = 0;
-    		this.perfWindowStart = now;
-    		this.perfMaxFrameMs = 0;
-    		this.perfMaxGapMs = 0;
-    		this.perfSumFrameMs = 0;
-    	} catch (error) {
-    		// deliberately silent - a broken counter is not worth a log line every 25ms
-    	}
     }
 
 
