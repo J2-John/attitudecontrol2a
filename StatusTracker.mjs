@@ -10,6 +10,7 @@
 
 // import modules
 import os from 'os';
+import fs from 'fs';
 import eventHub from './EventHub.mjs';
 
 import Logger from './Logger.mjs';
@@ -21,6 +22,18 @@ import configManager from './ConfigManager.mjs';
 
 // variables
 const SAMPLE_INTERVAL = 15000;  // interval for how often to check system status (should be 15000ms)
+
+// Kernel-exposed CPU frequency and thermal state. All of these are virtual files - reading
+// them costs nothing and touches no storage.
+//
+// Why this matters: field devices showing 6-9fps were found pinned at 100MHz of a possible
+// 1512MHz because the SoC sits above its 60C passive trip point and the kernel clamps
+// scaling_max_freq to hold it there. The device looks healthy by every other measure. The
+// diagnostic is scaling_max_freq < cpuinfo_max_freq - a software restore is reverted by the
+// kernel within seconds, so the fix is physical cooling.
+const CPUFREQ_DIR = '/sys/devices/system/cpu/cpu0/cpufreq';
+const THERMAL_ZONE = '/sys/class/thermal/thermal_zone0';
+const COOLING_DEVICE = '/sys/class/thermal/cooling_device0';
 
 
 
@@ -88,6 +101,8 @@ class StatusTracker {
                 diskUsage: 'unknown',
 
                 networkInterfaces: os.networkInterfaces(),
+
+                ...this.getCpuStatus(),
             };
 
             // TEMP log the current system status object
@@ -106,6 +121,73 @@ class StatusTracker {
                 status: 'errored',
                 data: `Error processing system status: ${error}`,
             });
+        }
+    }
+
+
+    // read a sysfs file, returning a trimmed string or null. Never throws: these paths differ
+    // between kernels and boards, and a missing file must not take down status reporting.
+    readSysfs(path) {
+        try {
+            return fs.readFileSync(path, 'utf8').trim();
+        } catch (error) {
+            return null;
+        }
+    }
+
+
+    // same, parsed as an integer, or null
+    readSysfsInt(path) {
+        const raw = this.readSysfs(path);
+        if (raw === null) { return null; }
+
+        const value = parseInt(raw, 10);
+        return Number.isNaN(value) ? null : value;
+    }
+
+
+    // collect CPU frequency and thermal state. Returns an object of nulls on a board that
+    // does not expose these, rather than failing.
+    getCpuStatus() {
+        try {
+            // cpufreq reports kHz
+            const curKHz = this.readSysfsInt(`${CPUFREQ_DIR}/scaling_cur_freq`);
+            const minKHz = this.readSysfsInt(`${CPUFREQ_DIR}/scaling_min_freq`);
+            const maxKHz = this.readSysfsInt(`${CPUFREQ_DIR}/scaling_max_freq`);
+            const hwMaxKHz = this.readSysfsInt(`${CPUFREQ_DIR}/cpuinfo_max_freq`);
+
+            // thermal zone reports millidegrees C
+            const tempMilliC = this.readSysfsInt(`${THERMAL_ZONE}/temp`);
+
+            const toMHz = (kHz) => (kHz === null ? null : Math.round(kHz / 1000));
+
+            const cpuFreqMaxMHz = toMHz(maxKHz);
+            const cpuFreqHwMaxMHz = toMHz(hwMaxKHz);
+
+            return {
+                cpuFreqMHz: toMHz(curKHz),
+                cpuFreqMinMHz: toMHz(minKHz),
+                cpuFreqMaxMHz: cpuFreqMaxMHz,
+                cpuFreqHwMaxMHz: cpuFreqHwMaxMHz,
+                cpuGovernor: this.readSysfs(`${CPUFREQ_DIR}/scaling_governor`),
+
+                cpuTempC: tempMilliC === null ? null : Math.round(tempMilliC / 100) / 10,
+
+                // the single most useful field: true means the kernel has capped this CPU
+                // below what the hardware can do, which on this board means thermal throttling
+                cpuThrottled: (cpuFreqMaxMHz !== null && cpuFreqHwMaxMHz !== null)
+                    ? (cpuFreqMaxMHz < cpuFreqHwMaxMHz)
+                    : null,
+
+                // how hard the cooling policy is currently pushing. curState at maxState means
+                // the kernel has run out of room and is holding the clock at its floor.
+                coolingType: this.readSysfs(`${COOLING_DEVICE}/type`),
+                coolingState: this.readSysfsInt(`${COOLING_DEVICE}/cur_state`),
+                coolingMaxState: this.readSysfsInt(`${COOLING_DEVICE}/max_state`),
+            };
+        } catch (error) {
+            // status reporting is more important than these extras
+            return {};
         }
     }
 
