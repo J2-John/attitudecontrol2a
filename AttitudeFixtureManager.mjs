@@ -29,6 +29,18 @@ import { TRANSITIONS } from './Transitions.js';
 const DMX_FRAME_INTERVAL = 25;  // interval speed in milliseconds for each DMX frame (should be 25ms)
 const GAMMA = 1.7;
 
+// Precomputed gamma curve (perf, 2026-08).
+// applyGamma() ran Math.pow four times per segment per engine per frame - on a 79 segment
+// site with 4 engines that is over 1,200 pow calls every 25 ms, and pow is a library call
+// on the A53. Every input is an integer 0-255 (engine colours are validated integers and
+// every fade result is Math.round'ed), so the whole domain fits in a 256 entry table and
+// the lookup is exact, not an approximation. Verified identical for all 256 inputs.
+// Anything outside that domain still takes the original path.
+const GAMMA_TABLE = new Uint8Array(256);
+for (let i = 0; i < 256; i++) {
+	GAMMA_TABLE[i] = Math.round(Math.pow(i / 255, GAMMA) * 255);
+}
+
 
 // ==================== TEMPORARY PERFORMANCE INSTRUMENTATION ====================
 // Added 2026-08 to diagnose low frame rates. Times each phase of processFixtures and
@@ -660,6 +672,12 @@ class AttitudeFixtureManager {
 
 	// actually apply gamma to a value
 	applyGamma(value) {
+		// table lookup for the normal case (integer 0-255), identical result
+		if (Number.isInteger(value) && value >= 0 && value <= 255) {
+			return GAMMA_TABLE[value];
+		}
+
+		// anything else keeps the original behaviour exactly
   		return Math.round(Math.pow(value / 255, GAMMA) * 255);
 	}
 }

@@ -54,6 +54,25 @@ class AttitudeEngine3 {
         // initialize randomness seed
         this.randomnessSeed = this.generateRandomNumberSeed(RETURN_DATA_ARRAY_LENGTH, RETURN_DATA_ARRAY_LENGTH);
         // console.log(this.randomnessSeed);
+
+        // ---- base cache (perf, 2026-08) ----
+        // The colour base is a pure function of the show's configuration: colours,
+        // transition, transition width, size and show type. It does NOT depend on
+        // beatCounter or frameCounter. It was previously rebuilt from scratch on every
+        // frame, which was the single largest cost in the render loop. It is now built
+        // once per configuration and reused until the configuration actually changes.
+        // Nothing downstream mutates the array in place - every stage reassigns
+        // this.pixelData to a new array - so handing out the cached array is safe.
+        this._baseSig = null;
+        this._baseData = null;
+        this._baseScalars = null;
+
+        // ---- fixture split cache (perf, 2026-08) ----
+        // getFixtureColor() rebuilt the decimated fixture array on every single call,
+        // and the fixture manager calls it once per segment per frame. pixelData cannot
+        // change between run() calls, so the split is computed at most once per frame.
+        this._splitCache = null;
+        this._splitCacheCount = -1;
     }
 
     // configure the engine with certain parameters. note that this function does not require all parameters to be present
@@ -78,6 +97,10 @@ class AttitudeEngine3 {
         if (!Number.isInteger(fixtureCount) || fixtureCount < 0 || fixtureCount > RETURN_DATA_ARRAY_LENGTH) {
             throw new Error(`Invalid fixture count. Fixture count must be an integer between 0 and ${RETURN_DATA_ARRAY_LENGTH}.`);
         } else {
+            if (this.fixtureCount !== fixtureCount) {
+                this._splitCache = null;
+                this._splitCacheCount = -1;
+            }
             this.fixtureCount = fixtureCount;
         }
     }
@@ -95,8 +118,14 @@ class AttitudeEngine3 {
                 Expected between 0 and ${RETURN_DATA_ARRAY_LENGTH}, but got ${fixtureCount}`);
         }
 
-        // evenly split the array by the number of fixtures
-        var fixtureColors = this.splitArrayIntoNumberOfItems(this.pixelData, this.fixtureCount);
+        // evenly split the array by the number of fixtures.
+        // memoised for the current frame - see _splitCache note in the constructor.
+        var fixtureColors = this._splitCache;
+        if (fixtureColors === null || this._splitCacheCount !== this.fixtureCount) {
+            fixtureColors = this.splitArrayIntoNumberOfItems(this.pixelData, this.fixtureCount);
+            this._splitCache = fixtureColors;
+            this._splitCacheCount = this.fixtureCount;
+        }
 
         // console.log('INDEX IS ' + index + ' and FIXTURECOLORS length is ' + fixtureColors.length + ' and FIXTURE COUNT is ' + this.fixtureCount);
 
@@ -222,6 +251,9 @@ class AttitudeEngine3 {
     run() {
         this.incrementFrameCounter();
 
+        // pixelData is about to be rebuilt, so last frame's fixture split is stale
+        this._splitCache = null;
+
         try {
             switch (this.config.showType) {
                 case SHOWTYPES.STATIC:
@@ -243,6 +275,53 @@ class AttitudeEngine3 {
 
 
     // Effect calculation methods
+
+    // build a signature of every configuration value the colour base depends on.
+    // beatCounter/frameCounter are deliberately absent - the base is frame independent.
+    baseSignature() {
+        const c = this.config;
+        const colors = c.colors;
+        let sig = c.showType + '|' + c.transition + '|' + c.transitionWidth + '|' + c.size + '|' + colors.length;
+        for (let i = 0; i < colors.length; i++) {
+            const col = colors[i];
+            sig += '|' + col.red + ',' + col.green + ',' + col.blue;
+        }
+        return sig;
+    }
+
+    // prepare the colour base for this frame, from cache when the configuration is unchanged.
+    // builder is the function that constructs the base; flip says whether this effect flips it.
+    prepareBase(builder, flip) {
+        const sig = this.baseSignature();
+
+        if (this._baseSig === sig && this._baseData !== null) {
+            // cache hit - restore the derived scalars the later stages read, then reuse the array
+            const s = this._baseScalars;
+            this.pixelsPerColor = s.pixelsPerColor;
+            this.pixelsToFadePerColor = s.pixelsToFadePerColor;
+            this.staticPixelsPerColor = s.staticPixelsPerColor;
+            this.lengthOfColorPulseSegment = s.lengthOfColorPulseSegment;
+            this.basePixels = s.basePixels;
+            this.pixelData = this._baseData;
+            return;
+        }
+
+        // cache miss - build it, flip it if this effect flips, and store the result
+        builder.call(this);
+        if (flip) {
+            this.flipPixelData();
+        }
+
+        this._baseSig = sig;
+        this._baseData = this.pixelData;
+        this._baseScalars = {
+            pixelsPerColor: this.pixelsPerColor,
+            pixelsToFadePerColor: this.pixelsToFadePerColor,
+            staticPixelsPerColor: this.staticPixelsPerColor,
+            lengthOfColorPulseSegment: this.lengthOfColorPulseSegment,
+            basePixels: this.basePixels,
+        };
+    }
 
     // calculate the color base for all effects
     calculateColorBase() {
@@ -288,8 +367,8 @@ class AttitudeEngine3 {
 
     // play the chase effect color base on the pixels, statically. repeat to fill pixels if needed.
     calculateStaticEffect() {
-        // calculate the color base
-        this.calculateColorBase();
+        // calculate the color base (cached; static does not flip)
+        this.prepareBase(this.calculateColorBase, false);
 
         // expand length to 1000 (loop if necesary), or trim to 1000
         this.expandOrTrimPixelDataLength();
@@ -307,11 +386,8 @@ class AttitudeEngine3 {
 
     // all fade takes all fixtures and makes them the same color, then fades through each color in colors list
     calculateAllEffect() {
-        // calculate the color base
-        this.calculateColorBase();
-
-        // flip the result to make it more intelligently move down the line
-        this.flipPixelData();
+        // calculate the color base and flip it (both cached - see prepareBase)
+        this.prepareBase(this.calculateColorBase, true);
 
         // circulate array to animate it
         this.processCirculation();
@@ -342,11 +418,8 @@ class AttitudeEngine3 {
 
     // chase effect animates the color base across the pixels
     calculateChaseEffect() {
-        // calculate the color base
-        this.calculateColorBase();
-
-        // flip the result to make it more intelligently move down the line
-        this.flipPixelData();
+        // calculate the color base and flip it (both cached - see prepareBase)
+        this.prepareBase(this.calculateColorBase, true);
 
         // circulate array to animate it
         this.processCirculation();
@@ -370,8 +443,49 @@ class AttitudeEngine3 {
 
     // pulse effect
     calculatePulseEffect() {
+        // calculate the pulse base and flip it (both cached - see prepareBase)
+        this.prepareBase(this.calculatePulseBase, true);
+
+        // circulate array to animate it
+        this.processCirculation();
+
+        // expand length to 1000 (loop if necesary), or trim to 1000
+        this.expandOrTrimPixelDataLength();
+
+        // process the directions layer
+        this.processDirections();
+
+        // process the splits layer
+        this.processSplits();
+
+        // validate that the resulting length is long enough (or trim if too long)
+        this.validatePixelDataLength();
+    }
+
+
+    // build the colour base for the pulse effect (configuration dependent only)
+    calculatePulseBase() {
         // clear out pixelData variable
         this.pixelData = [];
+
+        // A pulse is a base colour with the remaining colours travelling through it, so
+        // it needs at least two colours. With exactly one colour the loop below produced
+        // an empty array, and expandPixelDataLength() then spun forever trying to grow
+        // an empty array to length - a hard hang of the render thread, not a catchable
+        // error. Fixed 2026-08-10. One colour now renders as that solid colour.
+        if (this.config.colors.length < 2) {
+            this.pixelsPerColor = RETURN_DATA_ARRAY_LENGTH;
+            this.lengthOfColorPulseSegment = RETURN_DATA_ARRAY_LENGTH;
+            this.pixelsToFadePerColor = 0;
+            this.staticPixelsPerColor = RETURN_DATA_ARRAY_LENGTH;
+            this.basePixels = RETURN_DATA_ARRAY_LENGTH;
+
+            const only = this.config.colors[0];
+            for (let p = 0; p < RETURN_DATA_ARRAY_LENGTH; p++) {
+                this.pixelData.push(only);
+            }
+            return;
+        }
 
         // Determine the number of pixels per color section
         // use ceiling function to ensure no leftovers
@@ -434,24 +548,6 @@ class AttitudeEngine3 {
 
 
 
-        // flip the result to make it more intelligently move down the line
-        this.flipPixelData();
-
-        // circulate array to animate it
-        this.processCirculation();
-
-        // expand length to 1000 (loop if necesary), or trim to 1000
-        this.expandOrTrimPixelDataLength();
-
-        // process the directions layer
-        this.processDirections();
-
-        // process the splits layer
-        this.processSplits();
-
-
-        // validate that the resulting length is long enough (or trim if too long)
-        this.validatePixelDataLength();
     }
 
 
@@ -568,33 +664,46 @@ class AttitudeEngine3 {
 
     // expand the pixel data length to the proper length, looping until 1000 is reached
     expandPixelDataLength() {
-        const resultArray = [];
-        let currentIndex = 0;
+        const source = this.pixelData;
+        const sourceLength = source.length;
 
-        // Loop until the result array reaches 1000 items
-        while (resultArray.length < RETURN_DATA_ARRAY_LENGTH) {
-            // Concatenate the original array
-            resultArray.push(...this.pixelData);
-
-            // Update the current index
-            currentIndex += this.pixelData.length;
+        // An empty source can never reach the target length, so the old while loop
+        // spun forever with no way out - the render thread hung and the device went
+        // dark with nothing logged. Guard it: throwing is caught by run(), which falls
+        // back to black and reports the error. Reachable via a 1-colour Pulse show,
+        // which is also fixed at source in calculatePulseBase(). 2026-08-10.
+        if (sourceLength === 0) {
+            throw new Error('Cannot expand an empty pixelData array to length ' + RETURN_DATA_ARRAY_LENGTH);
         }
 
-        // Trim the result array to exactly 1000 items and save to pixel data
-        this.pixelData = resultArray.slice(0, RETURN_DATA_ARRAY_LENGTH);
+        // Fill by index rather than push(...source). The spread passed one argument per
+        // pixel, so a large intermediate array (a Pulse show with many colours at a large
+        // size builds hundreds of thousands of pixels) exceeded the JS argument limit and
+        // threw RangeError, which run() swallowed - the show silently rendered as the
+        // fallback colour. Indexed writes have no argument limit and are faster. 2026-08-10.
+        const resultArray = new Array(RETURN_DATA_ARRAY_LENGTH);
+        for (let i = 0; i < RETURN_DATA_ARRAY_LENGTH; i++) {
+            resultArray[i] = source[i % sourceLength];
+        }
+
+        this.pixelData = resultArray;
     }
 
     // expand to 1000 (loop if necesary) or trim to 1000
     expandOrTrimPixelDataLength() {
+        // expandPixelDataLength() now always produces exactly RETURN_DATA_ARRAY_LENGTH
+        // items, so the trim that used to follow it was a full array copy that changed
+        // nothing. trimPixelDataLength() is retained for callers that need it.
         this.expandPixelDataLength();
-        this.trimPixelDataLength();
     }
 
     // validate that the pixel data array is the proper length (and still trim it down in case it's too long)
     validatePixelDataLength() {
         if (this.pixelData.length < RETURN_DATA_ARRAY_LENGTH) {
             throw new Error(`Invalid this.pixelData length (too short). Expected ${RETURN_DATA_ARRAY_LENGTH}, but got ${this.pixelData.length}.`);
-        } else {
+        } else if (this.pixelData.length > RETURN_DATA_ARRAY_LENGTH) {
+            // only copy when there is something to trim - the common case is already
+            // exactly the right length, where the slice was a wasted full copy
             this.pixelData = this.pixelData.slice(0, RETURN_DATA_ARRAY_LENGTH);
         }
     }
@@ -757,8 +866,15 @@ class AttitudeEngine3 {
         const len = arr.length;
         const shift = positions % len; // This handles cases where positions > len
 
-        // Create a new array with the circulated elements
-        const circulated = arr.slice(-shift).concat(arr.slice(0, -shift));
+        // Create a new array with the circulated elements.
+        // Was slice(-shift).concat(slice(0, -shift)), which allocated three arrays;
+        // this writes the same elements into one. Identical for positive, zero and
+        // negative shift - element i is arr[(len - shift + i) % len] in every case.
+        const circulated = new Array(len);
+        const start = len - shift;
+        for (let i = 0; i < len; i++) {
+            circulated[i] = arr[(start + i) % len];
+        }
         return circulated;
     }
 
