@@ -676,14 +676,29 @@ class AttitudeEngine3 {
             throw new Error('Cannot expand an empty pixelData array to length ' + RETURN_DATA_ARRAY_LENGTH);
         }
 
-        // Fill by index rather than push(...source). The spread passed one argument per
-        // pixel, so a large intermediate array (a Pulse show with many colours at a large
-        // size builds hundreds of thousands of pixels) exceeded the JS argument limit and
-        // threw RangeError, which run() swallowed - the show silently rendered as the
-        // fallback colour. Indexed writes have no argument limit and are faster. 2026-08-10.
-        const resultArray = new Array(RETURN_DATA_ARRAY_LENGTH);
-        for (let i = 0; i < RETURN_DATA_ARRAY_LENGTH; i++) {
-            resultArray[i] = source[i % sourceLength];
+        // Build without push(...source). The spread passed one argument per pixel, so a
+        // large intermediate array (a Pulse show with many colours at a large size builds
+        // hundreds of thousands of pixels) exceeded the JS argument limit and threw
+        // RangeError, which run() swallowed - the show silently rendered as the fallback
+        // colour. 2026-08-10.
+        //
+        // Construction style matters as much as the algorithm here. `new Array(n)` plus
+        // indexed writes produces a HOLEY array, and V8 checks for holes on every read for
+        // the life of that array. On the A53 that cost is paid by every downstream stage and
+        // it measured worse on device than the code it replaced, despite looking faster on
+        // x86. slice() and push() keep the array PACKED. Verified with %HasHoleyElements.
+        // Do not "optimise" this back into new Array(n) + index assignment.
+        if (sourceLength >= RETURN_DATA_ARRAY_LENGTH) {
+            this.pixelData = source.slice(0, RETURN_DATA_ARRAY_LENGTH);
+            return;
+        }
+
+        const resultArray = source.slice();
+        while (resultArray.length + sourceLength <= RETURN_DATA_ARRAY_LENGTH) {
+            pushAllChunked(resultArray, source);
+        }
+        if (resultArray.length < RETURN_DATA_ARRAY_LENGTH) {
+            pushAllChunked(resultArray, source.slice(0, RETURN_DATA_ARRAY_LENGTH - resultArray.length));
         }
 
         this.pixelData = resultArray;
@@ -867,14 +882,12 @@ class AttitudeEngine3 {
         const shift = positions % len; // This handles cases where positions > len
 
         // Create a new array with the circulated elements.
-        // Was slice(-shift).concat(slice(0, -shift)), which allocated three arrays;
-        // this writes the same elements into one. Identical for positive, zero and
-        // negative shift - element i is arr[(len - shift + i) % len] in every case.
-        const circulated = new Array(len);
-        const start = len - shift;
-        for (let i = 0; i < len; i++) {
-            circulated[i] = arr[(start + i) % len];
-        }
+        // This briefly used `new Array(len)` plus indexed writes to save two allocations.
+        // That produces a HOLEY array, which V8 then hole-checks on every subsequent read,
+        // and it measured slower on the A53 even though it looked faster on x86. slice()
+        // and concat() both return PACKED arrays and the allocations are cheaper than the
+        // hole checks. Reverted 2026-08-10 - see the note in expandPixelDataLength().
+        const circulated = arr.slice(-shift).concat(arr.slice(0, -shift));
         return circulated;
     }
 
@@ -882,7 +895,11 @@ class AttitudeEngine3 {
     // stretch an array from its original length to the newSize parameter
     stretchArray(originalArray, newSize) {
         const originalSize = originalArray.length;
-        const stretchedArray = new Array(newSize);
+
+        // push into an empty array rather than filling a `new Array(newSize)`. Same values
+        // in the same order, but PACKED instead of HOLEY - see expandPixelDataLength().
+        // This one predates 2026-08 and was holey on shipped 2.A.4 as well.
+        const stretchedArray = [];
 
         // Calculate the step size for even distribution
         const step = originalSize / newSize;
@@ -890,7 +907,7 @@ class AttitudeEngine3 {
         for (let i = 0; i < newSize; i++) {
             // Calculate the corresponding position in the original array
             const pos = Math.floor(i * step);
-            stretchedArray[i] = originalArray[pos];
+            stretchedArray.push(originalArray[pos]);
         }
 
         return stretchedArray;
@@ -983,6 +1000,21 @@ export { AttitudeEngine3 };
 
 
 // UTILITY FUNCTIONS
+
+// Append every item of `items` onto `target` in bounded chunks.
+// push.apply is a bulk append, but it passes one argument per element, and past roughly
+// 125,000 arguments that throws RangeError - which is how a large Pulse show used to fail
+// silently. Chunking keeps the argument count bounded whatever the source size, while
+// keeping `target` PACKED (a plain indexed fill would make it HOLEY and slow every later
+// read on the A53).
+function pushAllChunked(target, items) {
+    const CHUNK = 4096;
+    const total = items.length;
+    for (let i = 0; i < total; i += CHUNK) {
+        target.push.apply(target, items.slice(i, Math.min(i + CHUNK, total)));
+    }
+}
+
 function fadeFunc(color1, color2, steps, currentStep) {
     return Math.round(color2 / steps * currentStep + color1 / steps * (steps - currentStep));
 }
