@@ -294,14 +294,7 @@ class AttitudeEngine3 {
     prepareBase(builder, flip) {
         const sig = this.baseSignature();
 
-        // TEMPORARY DIAGNOSTIC 2026-08-10. The base cache produced a large win on x86 and
-        // no measurable win on device, which means either it is missing every frame or the
-        // base was never the cost on this hardware. These two counters tell them apart.
-        // Remove once answered. Additive only; never allowed to throw.
-        const _perf = globalThis.__ATTPERF;
-
         if (this._baseSig === sig && this._baseData !== null) {
-            if (_perf) { _perf.baseHit = (_perf.baseHit || 0) + 1; }
             // cache hit - restore the derived scalars the later stages read, then reuse the array
             const s = this._baseScalars;
             this.pixelsPerColor = s.pixelsPerColor;
@@ -314,8 +307,6 @@ class AttitudeEngine3 {
         }
 
         // cache miss - build it, flip it if this effect flips, and store the result
-        if (_perf) { _perf.baseMiss = (_perf.baseMiss || 0) + 1; }
-
         builder.call(this);
         if (flip) {
             this.flipPixelData();
