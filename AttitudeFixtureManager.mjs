@@ -46,7 +46,7 @@ for (let i = 0; i < 256; i++) {
 // Added 2026-08 to diagnose low frame rates. Times each phase of processFixtures and
 // reports a rolling 1-second summary through the existing moduleStatus channel.
 // ADDITIVE ONLY - no behaviour is changed. Remove once the cause is identified.
-if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0, baseHit: 0, baseMiss: 0 }; }
 const PERF = {
     frames: 0, cfg: 0n, uniq: 0n, gen: 0n, eng: 0n, patch: 0n,
     total: 0n, maxTotal: 0n, windowStart: 0n, lastCall: 0n, maxGap: 0n,
@@ -156,10 +156,20 @@ class AttitudeFixtureManager {
 	        			+ ' udpkb=' + (globalThis.__ATTPERF.udpBytes / 1024).toFixed(1)
 	        			+ ' sched=' + globalThis.__ATTPERF.schedCalls
 	        			+ ' schedms=' + (Number(globalThis.__ATTPERF.schedNs) / 1e6).toFixed(1)
-	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers;
+	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers
+	        			+ ' basehit=' + (globalThis.__ATTPERF.baseHit || 0)
+	        			+ ' basemiss=' + (globalThis.__ATTPERF.baseMiss || 0)
+	        			+ ' types=' + this.engineInstances.map(function (ei) {
+	        				var sh = (this.shows || []).find(function (s) { return s.id === ei.showId; });
+	        				if (!sh) { return '?'; }
+	        				var n = (sh.colors && sh.colors.length) ? sh.colors.length
+	        					: ((sh.colorsList && sh.colorsList.length) ? sh.colorsList.length : 0);
+	        				return (sh.showType || ('legacy' + sh.type)) + '/' + n + 'c/sz' + (sh.size || 0);
+	        			}, this).join(',');
 	        		globalThis.__ATTPERF.udpPackets = 0; globalThis.__ATTPERF.udpBytes = 0;
 	        		globalThis.__ATTPERF.schedCalls = 0; globalThis.__ATTPERF.schedNs = 0n;
 	        		globalThis.__ATTPERF.senseTriggers = 0;
+	        		globalThis.__ATTPERF.baseHit = 0; globalThis.__ATTPERF.baseMiss = 0;
 	        		PERF.frames = 0; PERF.cfg = 0n; PERF.uniq = 0n; PERF.gen = 0n;
 	        		PERF.eng = 0n; PERF.patch = 0n; PERF.total = 0n;
 	        		PERF.maxTotal = 0n; PERF.maxGap = 0n; PERF.windowStart = _t5;
