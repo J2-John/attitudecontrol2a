@@ -110,6 +110,21 @@ log() {
 	echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"
 }
 
+# Read a VERSION file.
+#
+# Keeps only the characters a version string is made of, which throws away line endings, NUL
+# bytes and - the reason this exists - a byte order mark. A VERSION file saved from PowerShell
+# or Notepad carries one, it is invisible in every editor, and it would make
+# "$CUR_VERSION" = "$NEW_VERSION" compare false forever. Every flagged device would reinstall
+# the same build, on a loop, for as long as the flag kept re-arming.
+#
+# Caught 2026-08-11 on a canary branch whose VERSION was written by 'echo' in PowerShell:
+# the log line read 'version <BOM>2.A.10-canary'. On the fleet it would not have been a bad
+# version string, it would have been an update loop across every device.
+read_version() {
+	tr -cd '[:alnum:]._+-' < "$1" 2>/dev/null
+}
+
 # Watch the app across the whole settle window and decide whether it is working.
 #
 # Deliberately does NOT ask pm2 whether it is happy. pm2 reports a process as
@@ -292,7 +307,7 @@ write_build_state() {
 	local installed
 	local tail_lines
 
-	installed="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+	installed="$(read_version "$APP_DIR/VERSION")"
 
 	# Last few log lines travel with the state. With no SSH into field devices this is often
 	# the only way anyone will ever see why something failed.
@@ -383,7 +398,7 @@ log "fetching $ZIP_URL"
 # the kind of transient failure retrying fixes, and treating it as fatal - as the first
 # version of this did - turns a blip into a device that never updates. Observed in the
 # field 2026-08-09: "zip is corrupt or incomplete" after curl reported success.
-CUR_VERSION="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+CUR_VERSION="$(read_version "$APP_DIR/VERSION")"
 
 fetch_max=4
 fetch_delay=10
@@ -432,7 +447,7 @@ if ! node --check "$SRC/AttitudeControl2A.js" 2>/dev/null; then
 	abort "downloaded entrypoint does not parse"
 fi
 
-NEW_VERSION="$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null)"
+NEW_VERSION="$(read_version "$SRC/VERSION")"
 
 # Nothing to do if we already have this version. Without this the updater downloads,
 # snapshots, rsyncs and restarts in order to arrive exactly where it started - and combined
