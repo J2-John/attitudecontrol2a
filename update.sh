@@ -444,6 +444,9 @@ command -v ss >/dev/null 2>&1 || abort "ss (iproute2) not found - cannot verify 
 
 mkdir -p "$WORK" || abort "cannot create work dir $WORK"
 
+# Nothing live has been touched yet, so an interruption here is free - just clean up.
+trap 'log "interrupted before any change was made"; rm -rf "$WORK"; exit 1' INT TERM
+
 # GitHub's archive endpoint rate-limits unauthenticated requests and answers with
 # 404 when it does - indistinguishable from a branch that does not exist. Observed
 # 2026-08-08 after roughly six pulls in twenty minutes from one IP. Several devices
@@ -536,6 +539,18 @@ rm -f "$SNAPSHOT/config.json"
 cp -p "$APP_DIR/config.json" "$SNAPSHOT/config.json" 2>/dev/null
 
 log "snapshot created: $SNAPSHOT"
+
+# From here on the live directory is going to be rewritten, so an interruption is NOT free.
+#
+# Observed on the bench 2026-08-11: a Ctrl-C during the watch loop left new files installed
+# and pm2 restarted, with no health check, no rollback and no build-state record - an
+# unverified build running and nothing anywhere saying so. That is the one state this script
+# exists to make impossible.
+#
+# So an interrupt from here on lands where every other failure lands: back on the build that
+# was known to work. The trap is cleared first so that a second Ctrl-C during the rollback
+# does not re-enter it.
+trap 'trap - INT TERM; log "interrupted after files were installed"; rollback "update was interrupted before the health check finished"' INT TERM
 
 # ---------------------------------------------------------------------------
 # 3. Install and restart.
