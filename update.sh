@@ -69,8 +69,22 @@ cd / || exit 1
 # A real crash loop still fails in seconds, because that is detected by the pid changing
 # rather than by the clock running out.
 MIN_STABLE_SECONDS=60    # must be up at least this long, and seen talking to the server
-MAX_WATCH_SECONDS=240    # ...but wait up to this long for a slow device to get there
+MAX_WATCH_SECONDS=300    # ...but wait up to this long for a slow device to get there
 KEEP_SNAPSHOTS=2      # older rollback snapshots are pruned to save SD space
+
+# With the render check running we are no longer INFERRING health from how long the process
+# has survived - we are watching it do its job. That is a stronger signal than duration, so
+# the stability window can be shorter. It is not zero: the pid check still only covers the
+# window we watch, and a build that dies at 40s should not have passed at 20s.
+#
+# Without the render check, duration is all we have, so it stays at 60.
+MIN_STABLE_WITH_RENDER=30
+
+# Asking pm2 for the pid costs a Node process start - about 1.5s on the bench device and far
+# more on one throttled to 100MHz. Doing that every 3s took CPU from the app we were trying
+# to measure, and inflated a 60s window to 92s of wall clock. So the loop uses kill -0, which
+# is free, and reconciles against pm2 occasionally and once more before passing.
+PM2_RECHECK_EVERY=10
 
 # --- render health -----------------------------------------------------------
 # ADDED 2026-08-11, after a build passed this health check with the lights frozen.
@@ -202,7 +216,7 @@ render_state_now() {
 }
 
 watch_and_check() {
-	local start_pid pid seen=0 samples=0 elapsed=0
+	local start_pid pid seen=0 samples=0 elapsed=0 t_start min_stable
 
 	start_pid="$(app_pid)"
 	case "$start_pid" in
@@ -211,31 +225,43 @@ watch_and_check() {
 			return 1
 			;;
 	esac
+	pid="$start_pid"
+
+	# The render check is the stronger of the two gates, so it buys a shorter one of these.
+	min_stable="$MIN_STABLE_SECONDS"
+	if [ "$RENDER_CHECK_APPLIES" -eq 1 ]; then
+		min_stable="$MIN_STABLE_WITH_RENDER"
+	fi
+
+	# Real elapsed time, not a count of loop iterations. The old version added 3 per pass and
+	# called it seconds, which was wrong by however long the work in the loop took - measured
+	# at 92s of wall clock for a nominal 60s window on the bench device, and unknown but much
+	# worse on a throttled one. A window whose real length nobody knows cannot be tuned.
+	t_start="$(date +%s)"
 
 	while [ "$elapsed" -lt "$MAX_WATCH_SECONDS" ]; do
 		sleep 3
-		elapsed=$((elapsed + 3))
+		elapsed=$(( $(date +%s) - t_start ))
 		samples=$((samples + 1))
 
-		pid="$(app_pid)"
-		case "$pid" in
-			''|*[!0-9]*)
-				log "health: no running process at t=${elapsed}s"
+		# Free liveness check. A crash-respawn gives pm2 a new pid, so the original one
+		# stops existing and this catches it on the next sample.
+		if ! kill -0 "$start_pid" 2>/dev/null; then
+			log "health: pid $start_pid is gone at t=${elapsed}s (the app crashed and was respawned)"
+			return 1
+		fi
+
+		# ...and reconcile with pm2 now and then, in case the process is lingering as a
+		# zombie or pm2 has moved on to a different one. Occasionally, because it is not free.
+		if [ $((samples % PM2_RECHECK_EVERY)) -eq 0 ]; then
+			pid="$(app_pid)"
+			if [ "$pid" != "$start_pid" ]; then
+				log "health: pid changed $start_pid -> ${pid:-none} at t=${elapsed}s (the app restarted)"
 				return 1
-				;;
-		esac
-
-		if [ "$pid" != "$start_pid" ]; then
-			log "health: pid changed $start_pid -> $pid at t=${elapsed}s (the app restarted)"
-			return 1
+			fi
 		fi
 
-		if ! kill -0 "$pid" 2>/dev/null; then
-			log "health: pid $pid died at t=${elapsed}s"
-			return 1
-		fi
-
-		if ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ':443'; then
+		if ss -tanp 2>/dev/null | grep "pid=${start_pid}," | grep -q ':443'; then
 			seen=$((seen + 1))
 		fi
 
@@ -262,12 +288,21 @@ watch_and_check() {
 			fi
 		fi
 
-		# Early exit. Once the process has held together for MIN_STABLE_SECONDS, we have
+		# Early exit. Once the process has held together for the stability window, we have
 		# actually watched it reach the server, and it is doing the work it exists to do,
-		# there is nothing further to learn by waiting - and on a healthy device this
-		# finishes sooner than the old fixed window did.
-		if [ "$elapsed" -ge "$MIN_STABLE_SECONDS" ] && [ "$seen" -gt 0 ] \
+		# there is nothing further to learn by waiting.
+		if [ "$elapsed" -ge "$min_stable" ] && [ "$seen" -gt 0 ] \
 			&& { [ "$RENDER_CHECK_APPLIES" -eq 0 ] || [ "$render_state" = "ok" ] || [ "$RENDER_CHECK_MODE" = "observe" ]; }; then
+
+			# One authoritative pm2 check before accepting, whatever the sample count is.
+			# Everything above this point was deliberately cheap; this is the one place it
+			# is worth paying for certainty.
+			pid="$(app_pid)"
+			if [ "$pid" != "$start_pid" ]; then
+				log "health: pid changed $start_pid -> ${pid:-none} at t=${elapsed}s (the app restarted)"
+				return 1
+			fi
+
 			log "health: pid $pid stable ${elapsed}s, server contact on $seen of $samples samples, render=$render_state"
 			return 0
 		fi
@@ -522,7 +557,7 @@ fi
 # 4. Health check. A crash loop is the failure mode that matters most, because
 #    it is the one that costs a site visit.
 # ---------------------------------------------------------------------------
-log "restarted - watching (pass at ${MIN_STABLE_SECONDS}s, give up at ${MAX_WATCH_SECONDS}s)"
+log "restarted - watching (pass at $([ "$RENDER_CHECK_APPLIES" -eq 1 ] && echo "$MIN_STABLE_WITH_RENDER" || echo "$MIN_STABLE_SECONDS")s, give up at ${MAX_WATCH_SECONDS}s)"
 
 if ! watch_and_check; then
 	rollback "new build failed the health check"
