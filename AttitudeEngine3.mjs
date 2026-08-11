@@ -19,6 +19,20 @@ const MAX_COLOR_VALUE = 255; // max value for colors
 const SPEED_MIN_BPM = 10;
 const SPEED_MAX_BPM = 180;
 
+// How long one rendered frame lasts, in milliseconds. This MUST match the interval the
+// caller actually renders at - AttitudeFixtureManager's DMX_FRAME_INTERVAL - because every
+// show's animation speed is derived from it in updateFramesPerBeat().
+//
+// It used to be the bare literal 25 inside updateFramesPerBeat(), while the interval that
+// really drove the loop lived in a different file. The two agreed only by comment. Changing
+// the render rate without also editing that literal would have left every show in the
+// library animating at the wrong tempo - a 33ms interval against a hardcoded 25 plays every
+// show at 76% speed, fleet-wide, with nothing to indicate why.
+//
+// Callers should pass their real interval via setFrameInterval(). The default preserves the
+// historical value exactly.
+const DEFAULT_FRAME_INTERVAL_MS = 25;
+
 const SIZE_MIN = 1;
 const SIZE_MAX = 200;
 
@@ -35,6 +49,10 @@ class AttitudeEngine3 {
     // constructor with parameters argument (req. all params to be present)
     constructor(params) {
         this.config = {};
+
+        // frame duration must be known before updateFramesPerBeat() runs below
+        this.frameIntervalMs = DEFAULT_FRAME_INTERVAL_MS;
+
         this.validateRequiredParams(params); // Ensure all required parameters are present
         this.setParams(params); // Initialize configuration with provided parameters
 
@@ -90,6 +108,19 @@ class AttitudeEngine3 {
     setParams(params) {
         this.validateParams(params); // Validate the parameters
         Object.assign(this.config, params); // Merge the parameters into the configuration
+    }
+
+    // tell the engine how long one rendered frame lasts, so animation speed tracks the
+    // caller's real render interval instead of an assumed one. Safe to call at any time.
+    setFrameInterval(intervalMs) {
+        if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+            throw new Error(`Invalid frame interval. Expected a positive number of milliseconds, but got ${intervalMs}.`);
+        }
+
+        this.frameIntervalMs = intervalMs;
+
+        // framesPerBeat is derived from it, so it has to be recomputed
+        this.updateFramesPerBeat();
     }
 
     // set the number of fixtures to emulate for grabbing fixture values
@@ -649,7 +680,7 @@ class AttitudeEngine3 {
         // # of __ per ___
         this.beatsPerSecond = this.config.speed / 60;  // bpm (speed) / 60 sec/min. can't round bc <1 beat per second rounded to 0
         this.msPerBeat = 1000 / this.beatsPerSecond;  // # of milliseconds per beat
-        this.framesPerBeat = Math.round(this.msPerBeat / 25);  // msPerBeat / msPerFrame (25) = frames per beat
+        this.framesPerBeat = Math.round(this.msPerBeat / this.frameIntervalMs);  // msPerBeat / msPerFrame = frames per beat
 
         // calculate the diff and log these variables
         // var diff = (this.msPerBeat - (this.framesPerBeat * 25)); // diff between expected MS per beat and REAL ms per beat using 25ms interval
