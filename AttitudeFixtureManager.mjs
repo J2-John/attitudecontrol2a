@@ -16,6 +16,7 @@ import eventHub from './EventHub.mjs';
 import configManager from './ConfigManager.mjs';
 import attitudeScheduler from './AttitudeScheduler.mjs';
 import attitudeSACN from './AttitudeSACN2A.mjs';
+import showTableStore from './ShowTableStore.mjs';
 
 // import engine
 import { AttitudeEngine3 } from './AttitudeEngine3.mjs';
@@ -120,6 +121,10 @@ class AttitudeFixtureManager {
 				this.generateEngineInstances();
 				const _t3 = process.hrtime.bigint();
 
+				// advance every show table by one frame, before anything reads them, so all
+				// groups playing the same show stay in phase with each other
+				showTableStore.advance();
+
 				// process each engine instance, updating engine config if necesary and running engine
 				this.processEngineInstances();
 				const _t4 = process.hrtime.bigint();
@@ -156,10 +161,12 @@ class AttitudeFixtureManager {
 	        			+ ' udpkb=' + (globalThis.__ATTPERF.udpBytes / 1024).toFixed(1)
 	        			+ ' sched=' + globalThis.__ATTPERF.schedCalls
 	        			+ ' schedms=' + (Number(globalThis.__ATTPERF.schedNs) / 1e6).toFixed(1)
-	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers;
+	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers
+	        			+ ' ' + showTableStore.summary();
 	        		globalThis.__ATTPERF.udpPackets = 0; globalThis.__ATTPERF.udpBytes = 0;
 	        		globalThis.__ATTPERF.schedCalls = 0; globalThis.__ATTPERF.schedNs = 0n;
 	        		globalThis.__ATTPERF.senseTriggers = 0;
+	        		showTableStore.resetWindow();
 	        		PERF.frames = 0; PERF.cfg = 0n; PERF.uniq = 0n; PERF.gen = 0n;
 	        		PERF.eng = 0n; PERF.patch = 0n; PERF.total = 0n;
 	        		PERF.maxTotal = 0n; PERF.maxGap = 0n; PERF.windowStart = _t5;
@@ -325,6 +332,24 @@ class AttitudeFixtureManager {
 		    engineInstance.engine.setFixtureCount(fixtureSegments.length);
 		}
 
+	    // Server-rendered table for this show at this exact segment count, if we have one.
+	    // Tables already carry gamma and the white channel, so playback is a straight copy.
+	    // A null here is completely normal - it just means render locally, as we always have.
+	    let table = null;
+	    let tableOffset = -1;
+	    if (!(showId == 0)) {
+	    	showTableStore.registerNeed(showId, fixtureSegments.length);
+	    	table = showTableStore.get(showId, fixtureSegments.length);
+	    	if (table) {
+	    		tableOffset = showTableStore.offsetFor(showId, fixtureSegments.length);
+	    		// a frame that does not fit is not trusted - fall back rather than read past
+	    		// the end of the buffer
+	    		if (tableOffset < 0 || tableOffset + fixtureSegments.length * 4 > table.buf.length) {
+	    			table = null;
+	    		}
+	    	}
+	    }
+
 	    // now try to apply this show to the fixtures by iterating over each
 		try {
 			fixtureSegments.forEach((fixtureSegment, index) => {
@@ -338,15 +363,29 @@ class AttitudeFixtureManager {
 
 				// if the current show id isn't zero
 				if (!(showId == 0)) {
-					// get the color corresponding to this pixel
-					thisFixtureColor = engineInstance.engine.getFixtureColor(index);
+					if (table) {
+						// PLAYBACK: copy the pre-rendered frame, already gamma corrected
+						const o = tableOffset + index * 4;
+						thisFixtureColor = {
+							red: table.buf[o],
+							green: table.buf[o + 1],
+							blue: table.buf[o + 2],
+							white: table.buf[o + 3],
+						};
+					} else {
+						// RENDER: the original path, unchanged
+						thisFixtureColor = engineInstance.engine.getFixtureColor(index);
 
-					// process a white value for this color from RGB
-					thisFixtureColor.white = this.calculateWhiteFromRGB(thisFixtureColor);
+						// process a white value for this color from RGB
+						thisFixtureColor.white = this.calculateWhiteFromRGB(thisFixtureColor);
+
+						// now run a gamma curve function on this color
+						thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
+					}
+				} else {
+					// show id zero is black, still passed through gamma exactly as before
+					thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
 				}
-
-				// now run a gamma curve function on this color
-				thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
 
 				// check if this fixture should be highlighted
 				if (fixtureSegment.highlight) {
@@ -576,8 +615,15 @@ class AttitudeFixtureManager {
 		        });
 			}
 
-		    // now actually run the engine to process colors
-		    engineInstance.engine.run();
+		    // Now actually run the engine to process colors - unless every group playing this
+		    // show already has a server-rendered table, in which case rendering is pure waste.
+		    // The frame counter is still advanced so that if a table later goes missing and we
+		    // fall back to rendering, the show resumes in phase instead of jumping.
+		    if (showTableStore.isFullyCovered(engineInstance.showId)) {
+		    	engineInstance.engine.incrementFrameCounter();
+		    } else {
+		    	engineInstance.engine.run();
+		    }
 		});
 	}
 
@@ -613,6 +659,10 @@ class AttitudeFixtureManager {
 		                { red: 128, green: 128, blue: 128 },
 		            ]
 		        });
+
+		        // the engine derives every show's animation speed from the frame duration,
+		        // so tell it what we actually render at rather than letting it assume
+		        engine.setFrameInterval(DMX_FRAME_INTERVAL);
 
 		        // now push this to the engineInstances list
 	            this.engineInstances.push({
