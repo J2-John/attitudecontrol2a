@@ -18,6 +18,7 @@ import Logger from './Logger.mjs';
 const logger = new Logger('NetworkModule');
 
 import configManager from './ConfigManager.mjs';
+import showTableStore from './ShowTableStore.mjs';
 import idManager from './IdManager.mjs';
 
 
@@ -258,6 +259,13 @@ class NetworkModule {
     		// overwhelming majority of syncs. ConfigManager.update() merges only the keys present
     		// in a response, so a reply that omits the config leaves ours untouched.
     		configHash: configManager.getConfigHash(),
+
+    		// Server-rendered show tables. tableNeeds is the (showId, segments) pairs currently
+    		// being played - the server cannot work these out itself, because the schedule is
+    		// evaluated here. tableHashes is what we already hold, so unchanged tables are not
+    		// resent. Both are small: a handful of short strings.
+    		tableHashes: showTableStore.getHashes(),
+    		tableNeeds: showTableStore.getNeeds(),
     	};
 
     	// log the entire request object
@@ -557,6 +565,11 @@ class NetworkModule {
 
     		// update the config manager with the new data
     		configManager.update(data);
+
+    			// Apply any server-rendered show tables. Entirely best-effort: applyFromResponse
+    			// swallows anything malformed, and a refused or missing table simply means we keep
+    			// rendering that show locally, exactly as today.
+    			showTableStore.applyFromResponse(data);
 
     		// log success
     		if (configManager.checkLogLevel('detail')) {

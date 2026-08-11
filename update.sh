@@ -14,6 +14,10 @@
 #   4. Returns real exit codes and logs to a file. v1 always exited 0 and
 #      reported success unconditionally, so failures were invisible.
 #
+# v3, 2026-08-11: the health check now requires proof that the app is RENDERING, not just
+# that it is running. 2.A.9 passed v2's check with the lights frozen - see the render health
+# section below. This is the failure v2 could not see and v3 exists to catch.
+#
 # Usage:
 #   ./update.sh              install main
 #   ./update.sh some-branch  install a branch (canary testing)
@@ -64,12 +68,98 @@ cd / || exit 1
 # So: pass as soon as the build has proved itself, but wait a lot longer before giving up.
 # A real crash loop still fails in seconds, because that is detected by the pid changing
 # rather than by the clock running out.
-MIN_STABLE_SECONDS=60    # must be up at least this long, and seen talking to the server
-MAX_WATCH_SECONDS=240    # ...but wait up to this long for a slow device to get there
+# Both windows can be overridden from the environment. That exists for testing: with a 900s
+# timeout, exercising a failure path on the bench means waiting a quarter of an hour, and a
+# check nobody is willing to test is a check nobody tests. Not for production use.
+#   ATT_MIN_STABLE=10 ATT_MAX_WATCH=45 ./update.sh some-branch
+MIN_STABLE_SECONDS="${ATT_MIN_STABLE:-60}"    # must be up at least this long, and seen talking to the server
+MAX_WATCH_SECONDS="${ATT_MAX_WATCH:-900}"     # ...but wait up to this long for a slow device to get there
 KEEP_SNAPSHOTS=2      # older rollback snapshots are pruned to save SD space
+
+# Why 900 and not 240.
+#
+# 240 never meant 240 seconds. The old loop added 3 to a counter each pass and called it
+# seconds, while each pass also spent a measured 1.368s starting pm2 (bench device, 2026-08-11,
+# `time pm2 pid`) - so a nominal 240 was really ~360s here, and on AC-0020047 at 100MHz of
+# 1512, where starting Node costs far more, plausibly twenty minutes or more. That accidental
+# padding is the most likely reason this timeout has never fired on a throttled device.
+#
+# Now that the clock is honest, keeping 240 would QUIETLY CUT the budget on exactly the
+# devices the long window exists for, and a timeout there means rolling back a good build and
+# stranding the slowest units on old firmware forever. That is the failure this number was
+# introduced to prevent.
+#
+# So it goes up, and the asymmetry says to err long: a too-short timeout strands a device
+# permanently, a too-long one only delays a rollback that is coming anyway. It is also rarely
+# reached now - a genuinely broken render loop fails in about 9s on the errored path, so this
+# only governs the ambiguous states (no status file yet, not rendering yet), where patience is
+# what we actually want.
+
+# With the render check running we are no longer INFERRING health from how long the process
+# has survived - we are watching it do its job. That is a stronger signal than duration, so
+# the stability window can be shorter. It is not zero: the pid check still only covers the
+# window we watch, and a build that dies at 40s should not have passed at 20s.
+#
+# Without the render check, duration is all we have, so it stays at 60.
+MIN_STABLE_WITH_RENDER="${ATT_MIN_STABLE:-30}"
+
+# Asking pm2 for the pid costs a Node process start - measured at 1.368s on the bench device
+# and far more on one throttled to 100MHz. Doing that every 3s took CPU from the app we were
+# trying to measure, and inflated a 60s window to 92s of wall clock. So the loop uses kill -0,
+# which is free, and reconciles against pm2 occasionally and once more before passing.
+PM2_RECHECK_EVERY=10
+
+# --- render health -----------------------------------------------------------
+# ADDED 2026-08-11, after a build passed this health check with the lights frozen.
+#
+# 2.A.9 shipped a fixture manager that called a method the engine it shipped alongside did
+# not have. AttitudeFixtureManager threw on every frame, sACN went on transmitting the last
+# frame it had, and the device sat there with a stable pid and an open socket to the server.
+# The health check reported "pid stable 60s, server contact 20 of 20" and passed the build.
+#
+# Neither of the two things checked here can see that, and neither can be made to:
+#   - the pid is stable, because the throw is caught inside the render loop
+#   - the socket is open, because the network module is fine, and on the WebSocket build
+#     the connection is held open continuously whether or not anything else still runs
+#
+# There is also no log to grep. Logger has console output disabled on field units
+# (DEV_MODE=false) so that a fault cannot fill the SD card with log lines - which is
+# correct, and means stderr is empty on a device that is failing 40 times a second.
+#
+# So the app writes what it knows to a small file on a memory-backed filesystem every few
+# seconds - see writeLocalStatusFile() in ModuleStatusTracker.mjs - and we read it here.
+# That gives POSITIVE proof of work done rather than absence of evidence of failure, and it
+# catches a wedged event loop as well, which nothing above does.
+#
+# Set ATT_RENDER_CHECK=observe to log the render state without acting on it.
+RENDER_CHECK_MODE="${ATT_RENDER_CHECK:-require}"
+RENDER_STATUS_MARKER="ATTITUDE_STATUS_FILE_V1"
+RENDER_STATUS_FILES="/dev/shm/attitude-status /run/shm/attitude-status /tmp/attitude-status"
+RENDER_STALE_SECONDS=30   # the app rewrites it every 3s; 30 allows for a badly throttled device
+RENDER_FAIL_SAMPLES=3     # consecutive errored samples before we roll back, so one blip does not
+
+RESTART_EPOCH=0           # set just before the restart; the status file must be newer than this
+RENDER_CHECK_APPLIES=0    # set once we know whether the installed build writes the file at all
+render_errored_streak=0
+render_state="unknown"
 
 log() {
 	echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"
+}
+
+# Read a VERSION file.
+#
+# Keeps only the characters a version string is made of, which throws away line endings, NUL
+# bytes and - the reason this exists - a byte order mark. A VERSION file saved from PowerShell
+# or Notepad carries one, it is invisible in every editor, and it would make
+# "$CUR_VERSION" = "$NEW_VERSION" compare false forever. Every flagged device would reinstall
+# the same build, on a loop, for as long as the flag kept re-arming.
+#
+# Caught 2026-08-11 on a canary branch whose VERSION was written by 'echo' in PowerShell:
+# the log line read 'version <BOM>2.A.10-canary'. On the fleet it would not have been a bad
+# version string, it would have been an update loop across every device.
+read_version() {
+	tr -cd '[:alnum:]._+-' < "$1" 2>/dev/null
 }
 
 # Watch the app across the whole settle window and decide whether it is working.
@@ -95,8 +185,61 @@ app_pid() {
 	pm2 pid "$PM2_APP_NAME" 2>/dev/null | tr -d '[:space:]'
 }
 
+
+# Read one key out of the local status file. It is key=value lines rather than JSON
+# precisely so that this needs nothing but sed - field devices have no jq.
+status_value() {
+	sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
+}
+
+# Classify what the app is telling us about rendering. Echoes one word:
+#
+#   ok        fixtures are being processed (or the device is unassigned, which is
+#             legitimately not rendering anything - it outputs white and reports operational)
+#   waiting   alive but has not proved itself yet. Normal for the first second or two,
+#             and normal for a long time on a device throttled to 100MHz.
+#   errored   the fixture manager is catching an exception. THIS is the 2.A.9 failure.
+#   missing   no status file at all
+#   preboot   a file left over from the process we just replaced
+#   stale     the file stopped being updated - a wedged event loop looks like this
+render_state_now() {
+	local f found="" epoch now age fixtures fps assigned marker
+
+	for f in $RENDER_STATUS_FILES; do
+		if [ -f "$f" ]; then found="$f"; break; fi
+	done
+
+	if [ -z "$found" ]; then echo "missing"; return; fi
+
+	marker="$(status_value "$found" marker)"
+	if [ "$marker" != "$RENDER_STATUS_MARKER" ]; then echo "missing"; return; fi
+
+	epoch="$(status_value "$found" epoch)"
+	case "$epoch" in ''|*[!0-9]*) echo "missing"; return ;; esac
+
+	# Written by the previous process, before we restarted. Not evidence of anything.
+	if [ "$epoch" -lt "$RESTART_EPOCH" ]; then echo "preboot"; return; fi
+
+	now="$(date +%s)"
+	age=$((now - epoch))
+	if [ "$age" -gt "$RENDER_STALE_SECONDS" ]; then echo "stale"; return; fi
+
+	fixtures="$(status_value "$found" mod.AttitudeFixtureManager)"
+	if [ "$fixtures" = "errored" ]; then echo "errored"; return; fi
+	if [ "$fixtures" != "operational" ]; then echo "waiting"; return; fi
+
+	assigned="$(status_value "$found" assigned)"
+	if [ "$assigned" = "0" ]; then echo "ok"; return; fi
+
+	fps="$(status_value "$found" renderfps)"
+	case "$fps" in ''|*[!0-9]*) echo "waiting"; return ;; esac
+	if [ "$fps" -gt 0 ]; then echo "ok"; return; fi
+
+	echo "waiting"
+}
+
 watch_and_check() {
-	local start_pid pid seen=0 samples=0 elapsed=0
+	local start_pid pid seen=0 samples=0 elapsed=0 t_start min_stable
 
 	start_pid="$(app_pid)"
 	case "$start_pid" in
@@ -105,42 +248,99 @@ watch_and_check() {
 			return 1
 			;;
 	esac
+	pid="$start_pid"
+
+	# The render check is the stronger of the two gates, so it buys a shorter one of these.
+	min_stable="$MIN_STABLE_SECONDS"
+	if [ "$RENDER_CHECK_APPLIES" -eq 1 ]; then
+		min_stable="$MIN_STABLE_WITH_RENDER"
+	fi
+
+	# Real elapsed time, not a count of loop iterations. The old version added 3 per pass and
+	# called it seconds, which was wrong by however long the work in the loop took - measured
+	# at 92s of wall clock for a nominal 60s window on the bench device, and unknown but much
+	# worse on a throttled one. A window whose real length nobody knows cannot be tuned.
+	t_start="$(date +%s)"
 
 	while [ "$elapsed" -lt "$MAX_WATCH_SECONDS" ]; do
 		sleep 3
-		elapsed=$((elapsed + 3))
+		elapsed=$(( $(date +%s) - t_start ))
 		samples=$((samples + 1))
 
-		pid="$(app_pid)"
-		case "$pid" in
-			''|*[!0-9]*)
-				log "health: no running process at t=${elapsed}s"
+		# Free liveness check. A crash-respawn gives pm2 a new pid, so the original one
+		# stops existing and this catches it on the next sample.
+		if ! kill -0 "$start_pid" 2>/dev/null; then
+			log "health: pid $start_pid is gone at t=${elapsed}s (the app crashed and was respawned)"
+			return 1
+		fi
+
+		# ...and reconcile with pm2 now and then, in case the process is lingering as a
+		# zombie or pm2 has moved on to a different one. Occasionally, because it is not free.
+		if [ $((samples % PM2_RECHECK_EVERY)) -eq 0 ]; then
+			pid="$(app_pid)"
+			if [ "$pid" != "$start_pid" ]; then
+				log "health: pid changed $start_pid -> ${pid:-none} at t=${elapsed}s (the app restarted)"
 				return 1
-				;;
-		esac
-
-		if [ "$pid" != "$start_pid" ]; then
-			log "health: pid changed $start_pid -> $pid at t=${elapsed}s (the app restarted)"
-			return 1
+			fi
 		fi
 
-		if ! kill -0 "$pid" 2>/dev/null; then
-			log "health: pid $pid died at t=${elapsed}s"
-			return 1
-		fi
-
-		if ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ':443'; then
+		if ss -tanp 2>/dev/null | grep "pid=${start_pid}," | grep -q ':443'; then
 			seen=$((seen + 1))
 		fi
 
-		# Early exit. Once the process has held together for MIN_STABLE_SECONDS and we have
-		# actually watched it reach the server, there is nothing further to learn by waiting -
-		# and on a healthy device this finishes sooner than the old fixed window did.
-		if [ "$elapsed" -ge "$MIN_STABLE_SECONDS" ] && [ "$seen" -gt 0 ]; then
-			log "health: pid $pid stable ${elapsed}s, server contact on $seen of $samples samples"
+		if [ "$RENDER_CHECK_APPLIES" -eq 1 ]; then
+			render_state="$(render_state_now)"
+
+			if [ "$render_state" = "errored" ]; then
+				render_errored_streak=$((render_errored_streak + 1))
+			else
+				render_errored_streak=0
+			fi
+
+			# Fail fast on a genuinely broken render loop rather than waiting out the whole
+			# window. Several consecutive samples, so that one caught exception during
+			# startup - a config that arrives a moment late, say - is not a rollback.
+			if [ "$render_errored_streak" -ge "$RENDER_FAIL_SAMPLES" ]; then
+				if [ "$RENDER_CHECK_MODE" = "observe" ]; then
+					log "health: OBSERVE ONLY - fixture manager errored on $render_errored_streak consecutive samples at t=${elapsed}s"
+				else
+					log "health: fixture manager errored on $render_errored_streak consecutive samples at t=${elapsed}s - the app is up but not rendering"
+					log "health: $(grep . /dev/shm/attitude-status /run/shm/attitude-status /tmp/attitude-status 2>/dev/null | grep -E 'renderfps|overall|Fixture|SACN' | tr '\n' ' ')"
+					return 1
+				fi
+			fi
+		fi
+
+		# Early exit. Once the process has held together for the stability window, we have
+		# actually watched it reach the server, and it is doing the work it exists to do,
+		# there is nothing further to learn by waiting.
+		if [ "$elapsed" -ge "$min_stable" ] && [ "$seen" -gt 0 ] \
+			&& { [ "$RENDER_CHECK_APPLIES" -eq 0 ] || [ "$render_state" = "ok" ] || [ "$RENDER_CHECK_MODE" = "observe" ]; }; then
+
+			# One authoritative pm2 check before accepting, whatever the sample count is.
+			# Everything above this point was deliberately cheap; this is the one place it
+			# is worth paying for certainty.
+			pid="$(app_pid)"
+			if [ "$pid" != "$start_pid" ]; then
+				log "health: pid changed $start_pid -> ${pid:-none} at t=${elapsed}s (the app restarted)"
+				return 1
+			fi
+
+			log "health: pid $pid stable ${elapsed}s, server contact on $seen of $samples samples, render=$render_state"
 			return 0
 		fi
 	done
+
+	if [ "$RENDER_CHECK_APPLIES" -eq 1 ] && [ "$render_state" != "ok" ]; then
+		log "health: pid $pid stayed up ${MAX_WATCH_SECONDS}s but never proved it was rendering (render=$render_state, server contact on $seen of $samples samples)"
+		case "$render_state" in
+			missing) log "health: no local status file - the app never got as far as writing one" ;;
+			preboot) log "health: the only status file is older than the restart - the new process never wrote one" ;;
+			stale)   log "health: the status file stopped being updated - the event loop is wedged" ;;
+			waiting) log "health: fixtures never reported operational with a non-zero frame rate" ;;
+		esac
+		return 1
+	fi
 
 	log "health: pid $pid stayed up ${MAX_WATCH_SECONDS}s but never reached the server on :443"
 	log "health: cpu $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo '?') of $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo '?') kHz"
@@ -165,7 +365,7 @@ write_build_state() {
 	local installed
 	local tail_lines
 
-	installed="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+	installed="$(read_version "$APP_DIR/VERSION")"
 
 	# Last few log lines travel with the state. With no SSH into field devices this is often
 	# the only way anyone will ever see why something failed.
@@ -244,6 +444,9 @@ command -v ss >/dev/null 2>&1 || abort "ss (iproute2) not found - cannot verify 
 
 mkdir -p "$WORK" || abort "cannot create work dir $WORK"
 
+# Nothing live has been touched yet, so an interruption here is free - just clean up.
+trap 'log "interrupted before any change was made"; rm -rf "$WORK"; exit 1' INT TERM
+
 # GitHub's archive endpoint rate-limits unauthenticated requests and answers with
 # 404 when it does - indistinguishable from a branch that does not exist. Observed
 # 2026-08-08 after roughly six pulls in twenty minutes from one IP. Several devices
@@ -256,7 +459,7 @@ log "fetching $ZIP_URL"
 # the kind of transient failure retrying fixes, and treating it as fatal - as the first
 # version of this did - turns a blip into a device that never updates. Observed in the
 # field 2026-08-09: "zip is corrupt or incomplete" after curl reported success.
-CUR_VERSION="$(tr -d '\r\n' < "$APP_DIR/VERSION" 2>/dev/null)"
+CUR_VERSION="$(read_version "$APP_DIR/VERSION")"
 
 fetch_max=4
 fetch_delay=10
@@ -305,7 +508,7 @@ if ! node --check "$SRC/AttitudeControl2A.js" 2>/dev/null; then
 	abort "downloaded entrypoint does not parse"
 fi
 
-NEW_VERSION="$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null)"
+NEW_VERSION="$(read_version "$SRC/VERSION")"
 
 # Nothing to do if we already have this version. Without this the updater downloads,
 # snapshots, rsyncs and restarts in order to arrive exactly where it started - and combined
@@ -337,6 +540,18 @@ cp -p "$APP_DIR/config.json" "$SNAPSHOT/config.json" 2>/dev/null
 
 log "snapshot created: $SNAPSHOT"
 
+# From here on the live directory is going to be rewritten, so an interruption is NOT free.
+#
+# Observed on the bench 2026-08-11: a Ctrl-C during the watch loop left new files installed
+# and pm2 restarted, with no health check, no rollback and no build-state record - an
+# unverified build running and nothing anywhere saying so. That is the one state this script
+# exists to make impossible.
+#
+# So an interrupt from here on lands where every other failure lands: back on the build that
+# was known to work. The trap is cleared first so that a second Ctrl-C during the rollback
+# does not re-enter it.
+trap 'trap - INT TERM; log "interrupted after files were installed"; rollback "update was interrupted before the health check finished"' INT TERM
+
 # ---------------------------------------------------------------------------
 # 3. Install and restart.
 # ---------------------------------------------------------------------------
@@ -344,6 +559,20 @@ if ! rsync -a "$SRC/" "$APP_DIR/"; then
 	rollback "rsync failed partway through install"
 fi
 log "files installed"
+
+# Does the build we just installed write a local status file? Asked of the code that is now
+# running, not of a version number, so that installing an older build or a branch that
+# predates this simply skips the render check instead of rolling itself back.
+if grep -q "$RENDER_STATUS_MARKER" "$APP_DIR/ModuleStatusTracker.mjs" 2>/dev/null; then
+	RENDER_CHECK_APPLIES=1
+	log "render check: enabled (mode=$RENDER_CHECK_MODE)"
+else
+	log "render check: not available in this build - falling back to pid and server contact only"
+fi
+
+# Everything the status file says about the run before this moment is history. Recorded
+# before the restart so there is no window in which a leftover file could look current.
+RESTART_EPOCH="$(date +%s)"
 
 # pm2 is itself a Node CLI. On a device throttled to 100MHz of 1512 it can take many seconds
 # to start, and a single non-zero return rolled back a perfectly good build on AC-0020001.
@@ -366,7 +595,7 @@ fi
 # 4. Health check. A crash loop is the failure mode that matters most, because
 #    it is the one that costs a site visit.
 # ---------------------------------------------------------------------------
-log "restarted - watching (pass at ${MIN_STABLE_SECONDS}s, give up at ${MAX_WATCH_SECONDS}s)"
+log "restarted - watching (pass at $([ "$RENDER_CHECK_APPLIES" -eq 1 ] && echo "$MIN_STABLE_WITH_RENDER" || echo "$MIN_STABLE_SECONDS")s, give up at ${MAX_WATCH_SECONDS}s)"
 
 if ! watch_and_check; then
 	rollback "new build failed the health check"
