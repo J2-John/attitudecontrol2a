@@ -165,11 +165,52 @@ class ModuleStatusTracker {
     }
 
 
+    // isMemoryBacked - is this directory on a tmpfs/ramfs mount?
+    //
+    // The entire reason this file is not written to the SD card is erase-block wear: at one
+    // write per sample it is roughly 29,000 writes a day to the same few blocks, which is how
+    // AC-0020135's card died by way of config.json. A fallback that silently lands on the card
+    // would give that back without anyone noticing, so each candidate directory is checked
+    // rather than assumed. /dev/shm and /run/shm are tmpfs everywhere we run; /tmp is only
+    // sometimes, and this is what tells the difference.
+    //
+    // If we cannot tell, the answer is no. Losing this diagnostic costs an update rollback,
+    // which is visible and recoverable. Being wrong the other way costs a card.
+    isMemoryBacked(dir) {
+        try {
+            const mounts = fs.readFileSync('/proc/mounts', 'utf8').split('\n');
+
+            // longest matching mount point wins - /dev/shm must not be judged by /
+            let best = null;
+            for (const line of mounts) {
+                const parts = line.split(' ');
+                if (parts.length < 3) { continue; }
+
+                const point = parts[1];
+                const type = parts[2];
+                const prefix = (point === '/') ? '/' : point + '/';
+
+                if (dir === point || dir.indexOf(prefix) === 0) {
+                    if (best === null || point.length > best.point.length) {
+                        best = { point: point, type: type };
+                    }
+                }
+            }
+
+            return best !== null && (best.type === 'tmpfs' || best.type === 'ramfs');
+        } catch (error) {
+            return false;
+        }
+    }
+
+
     // resolveLocalStatusPath - pick the first memory-backed directory we can actually write to.
     // Resolved once, at the first write, rather than at import time: this module is constructed
     // while the app is still starting up and a throw there would take the whole app down.
     resolveLocalStatusPath() {
         for (const dir of LOCAL_STATUS_DIRS) {
+            if (!this.isMemoryBacked(dir)) { continue; }
+
             const candidate = dir + '/' + LOCAL_STATUS_FILENAME;
             try {
                 fs.writeFileSync(candidate + '.probe', LOCAL_STATUS_MARKER);
