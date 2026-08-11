@@ -68,9 +68,32 @@ cd / || exit 1
 # So: pass as soon as the build has proved itself, but wait a lot longer before giving up.
 # A real crash loop still fails in seconds, because that is detected by the pid changing
 # rather than by the clock running out.
-MIN_STABLE_SECONDS=60    # must be up at least this long, and seen talking to the server
-MAX_WATCH_SECONDS=300    # ...but wait up to this long for a slow device to get there
+# Both windows can be overridden from the environment. That exists for testing: with a 900s
+# timeout, exercising a failure path on the bench means waiting a quarter of an hour, and a
+# check nobody is willing to test is a check nobody tests. Not for production use.
+#   ATT_MIN_STABLE=10 ATT_MAX_WATCH=45 ./update.sh some-branch
+MIN_STABLE_SECONDS="${ATT_MIN_STABLE:-60}"    # must be up at least this long, and seen talking to the server
+MAX_WATCH_SECONDS="${ATT_MAX_WATCH:-900}"     # ...but wait up to this long for a slow device to get there
 KEEP_SNAPSHOTS=2      # older rollback snapshots are pruned to save SD space
+
+# Why 900 and not 240.
+#
+# 240 never meant 240 seconds. The old loop added 3 to a counter each pass and called it
+# seconds, while each pass also spent a measured 1.368s starting pm2 (bench device, 2026-08-11,
+# `time pm2 pid`) - so a nominal 240 was really ~360s here, and on AC-0020047 at 100MHz of
+# 1512, where starting Node costs far more, plausibly twenty minutes or more. That accidental
+# padding is the most likely reason this timeout has never fired on a throttled device.
+#
+# Now that the clock is honest, keeping 240 would QUIETLY CUT the budget on exactly the
+# devices the long window exists for, and a timeout there means rolling back a good build and
+# stranding the slowest units on old firmware forever. That is the failure this number was
+# introduced to prevent.
+#
+# So it goes up, and the asymmetry says to err long: a too-short timeout strands a device
+# permanently, a too-long one only delays a rollback that is coming anyway. It is also rarely
+# reached now - a genuinely broken render loop fails in about 9s on the errored path, so this
+# only governs the ambiguous states (no status file yet, not rendering yet), where patience is
+# what we actually want.
 
 # With the render check running we are no longer INFERRING health from how long the process
 # has survived - we are watching it do its job. That is a stronger signal than duration, so
@@ -78,12 +101,12 @@ KEEP_SNAPSHOTS=2      # older rollback snapshots are pruned to save SD space
 # window we watch, and a build that dies at 40s should not have passed at 20s.
 #
 # Without the render check, duration is all we have, so it stays at 60.
-MIN_STABLE_WITH_RENDER=30
+MIN_STABLE_WITH_RENDER="${ATT_MIN_STABLE:-30}"
 
-# Asking pm2 for the pid costs a Node process start - about 1.5s on the bench device and far
-# more on one throttled to 100MHz. Doing that every 3s took CPU from the app we were trying
-# to measure, and inflated a 60s window to 92s of wall clock. So the loop uses kill -0, which
-# is free, and reconciles against pm2 occasionally and once more before passing.
+# Asking pm2 for the pid costs a Node process start - measured at 1.368s on the bench device
+# and far more on one throttled to 100MHz. Doing that every 3s took CPU from the app we were
+# trying to measure, and inflated a 60s window to 92s of wall clock. So the loop uses kill -0,
+# which is free, and reconciles against pm2 occasionally and once more before passing.
 PM2_RECHECK_EVERY=10
 
 # --- render health -----------------------------------------------------------
