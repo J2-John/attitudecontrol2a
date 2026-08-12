@@ -49,6 +49,23 @@ try {
 	// non-fatal - an unknown fingerprint simply means every table is refused and we render
 }
 
+// Table binary layouts this firmware can interpret. Format 1 is
+// frames x segments x 4 bytes, R,G,B,W per segment, gamma and white pre-applied.
+const SUPPORTED_TABLE_FORMATS = [1];
+
+// Show generations this firmware's own engine can render. A show outside this list is
+// SERVER-ONLY: we play its table or the location's fallback show, and we never attempt to
+// render it. That is what lets new show types ship as a server deploy without placing any new,
+// untested load on field hardware.
+//
+// Legacy shows carry no engineVersion at all, hence the empty entries.
+const RENDERABLE_GENERATIONS = [undefined, null, '', '2A'];
+
+export function isDeviceRenderable(show) {
+	if (!show) return false;
+	return RENDERABLE_GENERATIONS.indexOf(show.engineVersion) !== -1;
+}
+
 const MAX_TABLES = 40;              // bounded so a churning schedule cannot grow memory forever
 const NEED_TTL_MS = 60000;          // stop asking for a table 60s after it was last used
 const MAX_NEEDS_PER_SYNC = 8;
@@ -60,6 +77,7 @@ class ShowTableStore {
 		this.needs = new Map();     // "showId:segments" -> { showId, segments, lastSeen }
 		this.cursors = new Map();   // "showId:segments" -> frame index
 		this.stats = { hits: 0, misses: 0, applied: 0, refused: 0, frames: 0 };
+		this.renderableById = new Map();   // showId -> can this device render it itself
 	}
 
 	key(showId, segments) { return showId + ':' + segments; }
@@ -133,16 +151,78 @@ class ShowTableStore {
 
 	// Apply tables from a sync response. Wrapped end to end: a malformed table must cost us
 	// that table and nothing else.
+	// Told by AttitudeFixtureManager which show ids this device can render itself, so
+	// applyFromResponse can pick the right validity rule for each table.
+	setRenderableShows(map) {
+		this.renderableById = map;
+	}
+
+	// Forget every table and go back to rendering locally, immediately.
+	//
+	// The server's eligibility list is the switch for table playback, but taking a device off
+	// that list only stops NEW tables arriving - tables live in memory here, so the device
+	// would go on playing the ones it already holds until something restarted it. With no
+	// remote shell into the fleet, that is not a switch, it is a hope.
+	//
+	// Needs are left alone deliberately: if the device becomes eligible again it should ask
+	// for its tables back without waiting for the schedule to come round again.
+	dropAll() {
+		if (this.tables.size === 0) return;
+		logger.info(`Dropping ${this.tables.size} show table(s) at the server's request - rendering locally`);
+		this.tables.clear();
+		this.cursors.clear();
+		this.stats.dropped = (this.stats.dropped || 0) + 1;
+	}
+
 	applyFromResponse(data) {
-		if (!data || !Array.isArray(data.showTables) || data.showTables.length === 0) return;
+		if (!data) return;
+
+		// Checked before the showTables test, so a drop is honoured on a reply that carries
+		// no tables - which is exactly the reply an ineligible device gets.
+		if (data.dropShowTables) { this.dropAll(); }
+
+		if (!Array.isArray(data.showTables) || data.showTables.length === 0) return;
+
+		const renderableById = this.renderableById || new Map();
 
 		for (const entry of data.showTables) {
 			try {
 				if (!entry || typeof entry.b64 !== 'string') { this.stats.refused++; continue; }
 
-				// Refuse anything not built by our own engine build - see the note on
-				// LOCAL_ENGINE_VERSION above.
-				if (entry.engine !== LOCAL_ENGINE_VERSION) {
+				// Can we interpret these bytes at all? Applies to every table regardless of
+				// generation - it asks what the layout is, not who produced it.
+				//
+				// A table with NO format field came from a gateway built before the field
+				// existed, and those tables are format 1 by definition - that layout is what
+				// the field was introduced to describe. Treating a missing field as unreadable
+				// would mean a device that updated before the server did refuses every table
+				// and silently reverts to local rendering, fleet-wide, for as long as the two
+				// were out of step. The firmware must tolerate the older server, not the other
+				// way round: we control when devices update far less precisely than we control
+				// when the gateway deploys.
+				const format = (entry.format === undefined || entry.format === null)
+					? 1
+					: Number(entry.format);
+
+				if (SUPPORTED_TABLE_FORMATS.indexOf(format) === -1) {
+					this.stats.refused++;
+					logger.warn(`Refused a table for show ${entry.showId}: table format ${entry.format} is not supported by this firmware`);
+					continue;
+				}
+
+				// The engine fingerprint is a DIVERGENCE check, and it only means anything for a
+				// show this device could render itself - there, server and device could disagree,
+				// and a mismatch means one of us is running different code.
+				//
+				// For a server-only generation the device has no renderer to diverge from, and
+				// applying this check would refuse every such table forever, since our engine
+				// cannot contain code it was never shipped. Format version is the whole contract
+				// in that case.
+				//
+				// Unknown show ids default to the STRICTER rule, so a table can never slip in by
+				// being unrecognised.
+				if (renderableById.get(Number(entry.showId)) !== false
+					&& entry.engine !== LOCAL_ENGINE_VERSION) {
 					this.stats.refused++;
 					logger.warn(`Refused a table for show ${entry.showId}: built by engine ${entry.engine}, we run ${LOCAL_ENGINE_VERSION}`);
 					continue;
@@ -197,7 +277,8 @@ class ShowTableStore {
 			+ ' hit=' + this.stats.hits
 			+ ' miss=' + this.stats.misses
 			+ ' applied=' + this.stats.applied
-			+ ' refused=' + this.stats.refused;
+			+ ' refused=' + this.stats.refused
+			+ (this.stats.dropped ? ' dropped=' + this.stats.dropped : '');
 	}
 
 	resetWindow() { this.stats.hits = 0; this.stats.misses = 0; }
