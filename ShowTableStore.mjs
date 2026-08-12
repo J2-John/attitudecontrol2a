@@ -191,7 +191,20 @@ class ShowTableStore {
 
 				// Can we interpret these bytes at all? Applies to every table regardless of
 				// generation - it asks what the layout is, not who produced it.
-				if (SUPPORTED_TABLE_FORMATS.indexOf(Number(entry.format)) === -1) {
+				//
+				// A table with NO format field came from a gateway built before the field
+				// existed, and those tables are format 1 by definition - that layout is what
+				// the field was introduced to describe. Treating a missing field as unreadable
+				// would mean a device that updated before the server did refuses every table
+				// and silently reverts to local rendering, fleet-wide, for as long as the two
+				// were out of step. The firmware must tolerate the older server, not the other
+				// way round: we control when devices update far less precisely than we control
+				// when the gateway deploys.
+				const format = (entry.format === undefined || entry.format === null)
+					? 1
+					: Number(entry.format);
+
+				if (SUPPORTED_TABLE_FORMATS.indexOf(format) === -1) {
 					this.stats.refused++;
 					logger.warn(`Refused a table for show ${entry.showId}: table format ${entry.format} is not supported by this firmware`);
 					continue;
