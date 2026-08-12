@@ -16,7 +16,7 @@ import eventHub from './EventHub.mjs';
 import configManager from './ConfigManager.mjs';
 import attitudeScheduler from './AttitudeScheduler.mjs';
 import attitudeSACN from './AttitudeSACN2A.mjs';
-import showTableStore from './ShowTableStore.mjs';
+import showTableStore, { isDeviceRenderable } from './ShowTableStore.mjs';
 
 // import engine
 import { AttitudeEngine3 } from './AttitudeEngine3.mjs';
@@ -224,6 +224,29 @@ class AttitudeFixtureManager {
 		this.fixtures = configManager.getFixtures();
 		this.shows = configManager.getShows();
 		this.schedule = attitudeScheduler.getFinalSchedule();
+
+		// The location's fallback show: what plays when a SERVER-ONLY show has no table yet.
+		// It must be a show this device can render itself. Anything missing or unrenderable
+		// leaves this null, and the not-found path takes over (white), which is what an
+		// unassigned device already does.
+		this.fallbackShowId = null;
+		const configuredFallback = configManager.getFallbackShowId
+			? configManager.getFallbackShowId()
+			: (configManager.config ? configManager.config.fallbackShowId : null);
+		if (configuredFallback) {
+			const fallbackShow = this.shows.find(itm => itm.id === configuredFallback);
+			if (fallbackShow && isDeviceRenderable(fallbackShow)) {
+				this.fallbackShowId = configuredFallback;
+			}
+		}
+
+		// Tell the table store which shows we could render ourselves, so it applies the
+		// fingerprint check only where divergence is actually possible.
+		const renderable = new Map();
+		for (const show of this.shows) {
+			if (show && show.id !== undefined) renderable.set(Number(show.id), isDeviceRenderable(show));
+		}
+		showTableStore.setRenderableShows(renderable);
 	}
 
 
@@ -315,16 +338,48 @@ class AttitudeFixtureManager {
 			return;
 		}
 
-		// get the engineInstance for this show id
+		// calculate all fixture segments (handling single, multicount, and segmented fixtures).
+	    // Computed before anything else now, because the segment count is what identifies a
+	    // show table and therefore what decides whether a server-only show can play at all.
+	    let fixtureSegments = this.calculateAllFixtureSegments(fixtures);
+
+	    // SHOW GENERATIONS.
+	    // A show this device's engine cannot render is SERVER-ONLY: we play its table, or we
+	    // substitute the location's fallback show. We never attempt to render one, which is what
+	    // stops a new show type placing any new, untested load on field hardware - and is what
+	    // lets new show types ship as a server deploy instead of a fleet firmware rollout.
+	    const thisShow = this.shows ? this.shows.find(itm => itm.id === showId) : undefined;
+	    if (!(showId == 0) && thisShow && !isDeviceRenderable(thisShow)) {
+	    	showTableStore.registerNeed(showId, fixtureSegments.length);
+
+	    	// offsetFor is a non-counting existence check, so this does not skew hit/miss
+	    	if (showTableStore.offsetFor(showId, fixtureSegments.length) < 0) {
+	    		showId = (this.fallbackShowId && this.fallbackShowId !== showId)
+	    			? this.fallbackShowId
+	    			: -1;
+	    	}
+	    }
+
+	    // get the engineInstance for this show id
 	    let engineInstance = this.engineInstances.find(itm => itm.showId === showId);
 
 	    // check if it's undefined
 	    if (engineInstance == undefined && !(showId == 0)) {
+	    	// A server-only show with no table and no usable fallback lands here. Output white,
+	    	// matching what an unassigned device and a not-found show already do, rather than
+	    	// throwing on every frame.
+	    	if (showId === -1) {
+	    		for (const seg of fixtureSegments) {
+	    			attitudeSACN.set(seg.universe, seg.startAddress, 255);
+	    			attitudeSACN.set(seg.universe, seg.startAddress + 1, 255);
+	    			attitudeSACN.set(seg.universe, seg.startAddress + 2, 255);
+	    			if (seg.colorMode == 'RGBW') attitudeSACN.set(seg.universe, seg.startAddress + 3, 255);
+	    		}
+	    		return;
+	    	}
+
 	    	throw new Error(`Unable to find an engne instance for show id ${showId}!`);
 	    }
-
-	    // calculate all fixture segments (handling single, multicount, and segmented fixtures)
-	    let fixtureSegments = this.calculateAllFixtureSegments(fixtures);
 
 	    // set the number of total segments to calculate for,
 	    // as long as the show id is not zero. If it's zero, we're just outputting black to all anyway.
@@ -630,7 +685,13 @@ class AttitudeFixtureManager {
 
 	// generateEngineInstances - generate any new engineInstances needed, and remove any not needed, based on this.uniqueShowIds
 	generateEngineInstances() {
-	    const uniqueIdSet = new Set(this.uniqueShowIds);
+	    // The fallback show needs a live engine even when the schedule never mentions it,
+	    // otherwise substituting to it would find no engine instance and throw.
+	    const wanted = this.uniqueShowIds.slice();
+	    if (this.fallbackShowId && wanted.indexOf(this.fallbackShowId) === -1) {
+	    	wanted.push(this.fallbackShowId);
+	    }
+	    const uniqueIdSet = new Set(wanted);
 
 	    // Create a map of current engineInstances for quick lookup
 	    const showMap = new Map();
@@ -642,7 +703,7 @@ class AttitudeFixtureManager {
 	    this.engineInstances = this.engineInstances.filter(show => uniqueIdSet.has(show.showId));
 
 	    // Add new items for each id in uniqueIds if not already present
-	    this.uniqueShowIds.forEach(id => {
+	    wanted.forEach(id => {
 	        if (!showMap.has(id)) {
 	        	// create the engine object
 	        	// whatever config is here will be the default for any invalid shows (ie. 1st gen engine shows)
