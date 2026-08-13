@@ -182,7 +182,8 @@ read_version() {
 # one connection open continuously, the HTTP build opens a short one every
 # second, and sampling across 90s catches either.
 app_pid() {
-	pm2 pid "$PM2_APP_NAME" 2>/dev/null | tr -d '[:space:]'
+	# 9>&- for the same reason as every other pm2 call - see the note on fd 9 below
+	pm2 pid "$PM2_APP_NAME" 2>/dev/null 9>&- | tr -d '[:space:]'
 }
 
 
@@ -242,8 +243,11 @@ watch_and_check() {
 	local start_pid pid seen=0 samples=0 elapsed=0 t_start min_stable
 
 	start_pid="$(app_pid)"
+	# '0' passes a digits-only test but is not a pid: kill -0 0 signals OUR OWN process
+	# group and always succeeds, so every liveness check below would silently pass.
+	# pm2 reports 0 for an app it is not currently running.
 	case "$start_pid" in
-		''|*[!0-9]*)
+		''|0|*[!0-9]*)
 			log "health: pm2 gave no usable pid after restart ('$start_pid')"
 			return 1
 			;;
@@ -284,7 +288,10 @@ watch_and_check() {
 			fi
 		fi
 
-		if ss -tanp 2>/dev/null | grep "pid=${start_pid}," | grep -q ':443'; then
+		# Anchored: a bare ':443' also matches the LOCAL port column, and the ephemeral
+		# range (32768-60999) contains 44300-44399 - so a device talking to nothing in
+		# particular could satisfy the server-contact gate by accident.
+		if ss -tanp 2>/dev/null | grep "pid=${start_pid}," | grep -qE ':443([^0-9]|$)'; then
 			seen=$((seen + 1))
 		fi
 
@@ -395,6 +402,11 @@ abort() {
 }
 
 rollback() {
+	# Disarm first, unconditionally. One caller (the failed install rsync) still has the
+	# trap armed, and a signal arriving mid-rollback would re-enter this function: a second
+	# pm2 stop, a second --delete rsync interleaved with the first, a second restart.
+	trap '' INT TERM HUP
+
 	log "ROLLING BACK: $*"
 	# Keep whatever config the device is holding now - it came from the server
 	# and is newer than the snapshot's copy.
@@ -409,6 +421,11 @@ rollback() {
 	if ! rsync -a --delete "$SNAPSHOT/" "$APP_DIR/"; then
 		log "CRITICAL: could not restore snapshot $SNAPSHOT - manual recovery needed"
 		pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1 9>&-
+		# This is the one outcome that certainly costs a site visit, and it was the only
+		# terminal path that recorded nothing - leaving StatusTracker reporting whatever the
+		# PREVIOUS run wrote while the device sits half restored.
+		write_build_state "restore-failed" "could not restore $SNAPSHOT - manual recovery needed"
+		rm -rf "$WORK"
 		exit 2
 	fi
 	cp -p "$WORK/config.json.keep" "$APP_DIR/config.json" 2>/dev/null
@@ -431,7 +448,7 @@ rollback() {
 # `pm2 restart` process kept fd 9 open, and the next update 26 seconds later was refused with
 # "another update is already running" - blocked by a lock whose owner no longer existed.
 LOCK_FILE="${HOME:-/home/attitude}/.attitude-update.lock"
-exec 9>"$LOCK_FILE" 2>/dev/null || true
+{ exec 9>"$LOCK_FILE"; } 2>/dev/null || true
 if ! flock -n 9 2>/dev/null; then
 	# Exit 0, not an error. The macro handshake treats a non-zero exit as failure and re-arms
 	# the update flag, so exiting non-zero here made a harmless collision look like a failed
@@ -517,6 +534,11 @@ fi
 
 NEW_VERSION="$(read_version "$SRC/VERSION")"
 
+# Without this, an empty NEW_VERSION can never equal CUR_VERSION, so the already-current guard
+# below never fires and every device reinstalls the same build on every flag re-arm. Same shape
+# and the same fleet-wide blast radius as the byte order mark that read_version exists for.
+[ -n "$NEW_VERSION" ] || abort "downloaded build has no usable VERSION file"
+
 # Nothing to do if we already have this version. Without this the updater downloads,
 # snapshots, rsyncs and restarts in order to arrive exactly where it started - and combined
 # with a re-armed flag that became a permanent loop on already-current devices. Set
@@ -577,8 +599,23 @@ else
 	log "render check: not available in this build - falling back to pid and server contact only"
 fi
 
-# Everything the status file says about the run before this moment is history. Recorded
-# before the restart so there is no window in which a leftover file could look current.
+# DELETE THE OLD PROCESS'S STATUS FILE, then record the moment.
+#
+# The outgoing app rewrites that file every ~3s and goes on doing so until pm2's kill actually
+# lands, so its final writes are stamped AFTER this moment and are not classified as preboot.
+# Staleness was then the only thing standing between us and reading a dead build's status: at
+# the earliest possible pass the leftover file's age is ~30s against a 30s cutoff. Two numbers
+# that happen to be equal were the whole margin, and if the new build never wrote a status file
+# at all we would have read the OLD one saying operational, and passed a device that is not
+# rendering. That is precisely the failure this check exists to catch.
+#
+# Deleting it first removes the class rather than widening the margin: any file present from
+# here on was necessarily written by the new process. These paths are tmpfs, so this costs
+# nothing on the card.
+for _sf in $RENDER_STATUS_FILES; do
+	rm -f "$_sf" 2>/dev/null
+done
+
 RESTART_EPOCH="$(date +%s)"
 
 # STOP LISTENING FOR INTERRUPTS FROM HERE ON.

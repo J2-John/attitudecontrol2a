@@ -257,11 +257,18 @@ class ModuleStatusTracker {
             // An unassigned device legitimately never renders anything - it outputs white and
             // reports operational. The updater has to know the difference, or it would roll
             // back every good build on a device that has not been assigned to a location yet.
-            let assigned = 0;
+            // -1 on failure, NOT 0.
+            //
+            // The updater treats assigned=0 as "legitimately not rendering - pass without
+            // requiring frames", which is the escape hatch for a device with no location. If
+            // a build that breaks config loading also reported 0, that escape hatch would
+            // become the error path, and the updater would pass exactly the build it should
+            // reject. -1 is neither, so it falls through to needing a real frame rate.
+            let assigned = -1;
             try {
                 assigned = configManager.getAssignedToLocation() ? 1 : 0;
             } catch (error) {
-                assigned = 0;
+                assigned = -1;
             }
 
             let contents = 'marker=' + LOCAL_STATUS_MARKER + '\n'
