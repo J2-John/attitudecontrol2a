@@ -400,7 +400,7 @@ rollback() {
 	# and is newer than the snapshot's copy.
 	cp -p "$APP_DIR/config.json" "$WORK/config.json.keep" 2>/dev/null
 
-	pm2 stop "$PM2_APP_NAME" >/dev/null 2>&1
+	pm2 stop "$PM2_APP_NAME" >/dev/null 2>&1 9>&-
 
 	# Restore with rsync --delete rather than removing and recreating the directory.
 	# This script lives inside APP_DIR and is still executing; deleting the directory
@@ -408,12 +408,12 @@ rollback() {
 	# something to rely on, even where the kernel tolerates it.
 	if ! rsync -a --delete "$SNAPSHOT/" "$APP_DIR/"; then
 		log "CRITICAL: could not restore snapshot $SNAPSHOT - manual recovery needed"
-		pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1
+		pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1 9>&-
 		exit 2
 	fi
 	cp -p "$WORK/config.json.keep" "$APP_DIR/config.json" 2>/dev/null
 
-	pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1
+	pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1 9>&-
 	log "rollback complete - restored from $SNAPSHOT"
 	write_build_state "rolled-back" "$*"
 	rm -rf "$WORK"
@@ -423,6 +423,13 @@ rollback() {
 # Only one updater at a time. The macro handshake re-arms the update flag on failure with
 # no cap, so a second run can start while the first is still installing - two processes
 # snapshotting and rsyncing the same directory produces silent, unreproducible corruption.
+# NOTE ON FD 9. Every command run from here on must close it explicitly with 9>&-, and the
+# pm2 calls below do. fd 9 is inherited by children, so a child that outlives this script goes
+# on holding the lock after we are gone.
+#
+# Observed 2026-08-13: the updater was killed during its own pm2 restart, but the orphaned
+# `pm2 restart` process kept fd 9 open, and the next update 26 seconds later was refused with
+# "another update is already running" - blocked by a lock whose owner no longer existed.
 LOCK_FILE="${HOME:-/home/attitude}/.attitude-update.lock"
 exec 9>"$LOCK_FILE" 2>/dev/null || true
 if ! flock -n 9 2>/dev/null; then
@@ -600,7 +607,7 @@ trap '' INT TERM HUP
 # to start, and a single non-zero return rolled back a perfectly good build on AC-0020001.
 restart_ok=0
 for restart_attempt in 1 2 3; do
-	if pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1; then
+	if pm2 restart "$PM2_APP_NAME" >/dev/null 2>&1 9>&-; then
 		restart_ok=1
 		break
 	fi
