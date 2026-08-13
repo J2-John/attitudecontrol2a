@@ -445,7 +445,7 @@ command -v ss >/dev/null 2>&1 || abort "ss (iproute2) not found - cannot verify 
 mkdir -p "$WORK" || abort "cannot create work dir $WORK"
 
 # Nothing live has been touched yet, so an interruption here is free - just clean up.
-trap 'log "interrupted before any change was made"; rm -rf "$WORK"; exit 1' INT TERM
+trap 'log "interrupted before any change was made"; rm -rf "$WORK"; exit 1' INT TERM HUP
 
 # GitHub's archive endpoint rate-limits unauthenticated requests and answers with
 # 404 when it does - indistinguishable from a branch that does not exist. Observed
@@ -550,7 +550,7 @@ log "snapshot created: $SNAPSHOT"
 # So an interrupt from here on lands where every other failure lands: back on the build that
 # was known to work. The trap is cleared first so that a second Ctrl-C during the rollback
 # does not re-enter it.
-trap 'trap - INT TERM; log "interrupted after files were installed"; rollback "update was interrupted before the health check finished"' INT TERM
+trap 'trap - INT TERM HUP; log "interrupted after files were installed"; rollback "update was interrupted before the health check finished"' INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # 3. Install and restart.
@@ -573,6 +573,28 @@ fi
 # Everything the status file says about the run before this moment is history. Recorded
 # before the restart so there is no window in which a leftover file could look current.
 RESTART_EPOCH="$(date +%s)"
+
+# STOP LISTENING FOR INTERRUPTS FROM HERE ON.
+#
+# This script is normally launched by MacrosModule with exec('./update.sh'), which makes it a
+# CHILD OF THE APP. The next thing it does is restart that app. pm2's default kill signal is
+# SIGINT and it kills the whole process tree, so the restart below delivers a signal to this
+# script every single time - not as a failure, but as the ordinary consequence of doing its job.
+#
+# The rollback trap armed at snapshot time therefore fired on every macro-triggered update:
+# install, get signalled, start rolling back, get killed mid-rollback, flag re-arms, repeat.
+# Observed on the bench 2026-08-12, three cycles in four minutes.
+#
+# So the trap is cleared before the restart rather than after it. It protected the window it
+# was written for - between the snapshot and the end of rsync, where an interrupt really does
+# leave a half-installed directory - and that window has now closed.
+#
+# HUP is included because a dying parent can deliver it too - the app is about to be that parent.
+#
+# NOTE: this means Ctrl-C no longer stops a manual run once the restart begins. That is the
+# correct trade: an interrupt here is far more likely to be pm2 doing its job than a person
+# changing their mind.
+trap '' INT TERM HUP
 
 # pm2 is itself a Node CLI. On a device throttled to 100MHz of 1512 it can take many seconds
 # to start, and a single non-zero return rolled back a perfectly good build on AC-0020001.
