@@ -9,7 +9,7 @@
 
 
 // import modules
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import fs from 'fs';
 import eventHub from './EventHub.mjs';
 
@@ -301,62 +301,75 @@ class MacrosModule {
                 // log that an update was queued
                 logger.info('Update queued from server!');
 
-                // Command to run the update
-                const command = './update.sh';
+                // LAUNCH THE UPDATER DETACHED, AND DO NOT WAIT FOR IT.
+                //
+                // exec() made update.sh a CHILD OF THIS PROCESS. The first thing it does is
+                // restart this process. pm2's default kill signal is SIGINT and it kills the
+                // whole tree, so every macro-triggered update killed the updater seconds after
+                // it installed the files - before the health check, before the rollback could
+                // arm, before the build state was written.
+                //
+                // The files were already in place, so updates appeared to work. They just
+                // completed unwatched. That is why the fleet census shows nearly every device
+                // reporting "already-current" and almost none reporting "updated": the run that
+                // actually installs has never survived to record what it did.
+                //
+                // detached:true puts the updater in its own session and process group, so a
+                // tree kill aimed at this app no longer reaches it. It outlives us, restarts us,
+                // watches the result and rolls back if it has to - which is the whole point of
+                // having an updater that health checks.
+                //
+                // We therefore cannot read its output any more, and should not want to: the
+                // outcome lands in attitude-build.json, which StatusTracker already reports on
+                // the normal status cycle. Waiting for a process whose job is to kill us was
+                // never going to work.
+                try {
+                    const child = spawn('./update.sh', [], {
+                        detached: true,
+                        stdio: 'ignore',
+                        cwd: process.cwd(),
+                    });
 
-                // Execute the command
-                exec(command, (error, stdout, stderr) => {
-                    if (error) {
-                        // if there was an error executing the command
+                    // let it go - without this, node keeps a handle to it and waits
+                    child.unref();
 
-                        // set the updateCommandSuccess variable to false, since the update failed
-                        this.updateCommandSuccess = false;
+                    this.updateCommandSuccess = true;
+                    this.updateCommandResults = 'Update launched. This app will be restarted by the updater; the outcome is reported in the build state.';
 
-                        // set the updateCommandResults variable to the error text
-                        this.updateCommandResults = `An error occurred during the update: ${error}`;
+                    logger.info(this.updateCommandResults);
 
-                        // log the error
-                        logger.error(this.updateCommandResults);
+                    // NOTE: restartPm2Async() is deliberately NOT called here.
+                    //
+                    // It schedules "sleep 30; pm2 restart all". Until now it never fired,
+                    // because the callback it sat in was never reached - the updater killed us
+                    // first. Now that the updater survives, it WOULD fire: thirty seconds into
+                    // the health check, restarting the app mid-watch, which the watcher would
+                    // correctly read as a crash and roll back a perfectly good build.
+                    //
+                    // update.sh restarts the app itself, at the right moment, and watches what
+                    // happens next. Nothing else should be restarting anything.
 
-                        // emit an event that we had an error
-                        eventHub.emit('moduleStatus', { 
-                            name: 'MacrosModule', 
-                            status: 'errored',
-                            data: this.updateCommandResults,
-                        });
+                    eventHub.emit('moduleStatus', {
+                        name: 'MacrosModule',
+                        status: 'operational',
+                        data: this.updateCommandResults,
+                    });
 
-                        // resolve with the erorr text
-                        resolve(this.updateCommandResults);
-                    } else {
-                        // otherwise success, so set this.updateCommandSuccess to true to indicate that the command was successful
-                        this.updateCommandSuccess = true;
+                    resolve(this.updateCommandResults);
+                } catch (error) {
+                    this.updateCommandSuccess = false;
+                    this.updateCommandResults = `An error occurred launching the update: ${error}`;
 
-                        // get the results string from running the update
-                        const lines = stdout.split('\n');
-                        const results = lines[lines.length - 2].trim();
+                    logger.error(this.updateCommandResults);
 
-                        // set the rebootCommandResults variable to the success output from console
-                        this.updateCommandResults = results;
+                    eventHub.emit('moduleStatus', {
+                        name: 'MacrosModule',
+                        status: 'errored',
+                        data: this.updateCommandResults,
+                    });
 
-                        // restart pm2 asyncronosly after 30 seconds.
-                        // this is intended to give the network module a second to let the server know
-                        // that the update was successful before restarting pm2
-                        this.restartPm2Async();
-
-                        // log the results as a success message
-                        logger.info(`${results} Restarting pm2 in 30 seconds.`);
-
-                        // emit a success event
-                        eventHub.emit('moduleStatus', { 
-                            name: 'MacrosModule', 
-                            status: 'operational',
-                            data: `${results} Restarting pm2 in 30 seconds.`,
-                        });
-
-                        // resolve with the success text
-                        resolve(`${results} Restarting pm2 in 30 seconds.`);
-                    }
-                });
+                    resolve(this.updateCommandResults);
+                }
             } else {
                 // otherwise, we don't need to update, so ensure that updateCommandResults is reset
                 this.updateCommandSuccess = false;
