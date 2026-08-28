@@ -549,7 +549,14 @@ class AttitudeFixtureManager {
 		    // check to make sure this show exists
 		    if (typeof show !== 'undefined') {
 			    // check if this show is designed for the current engine
-			    if (show.engineVersion == '2A') {
+			    if (!isDeviceRenderable(show)) {
+			    	// SERVER-ONLY show (a 2B sequence, or a 2C filtered show). We never render one:
+			    	// its output comes from a table, or from the fallback show's own engine instance.
+			    	// There is nothing to configure here, and handing it to the legacy translator
+			    	// below threw on show.colorsList once per frame - a key no 2B or 2C show has.
+			    	// The generation guard already exists in applyShowToFixtures(); this is the same
+			    	// rule applied to the CONFIGURATION path, which it was missing.
+			    } else if (show.engineVersion == '2A') {
 			    	// if so, update the parameters on the engine to match the show
 		            engineInstance.engine.configure({
 			            showType: show.showType,
