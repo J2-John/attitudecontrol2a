@@ -79,6 +79,11 @@ class UDPManager {
 
 	// handleMessage - process an incoming UDP message
 	handleMessage(message, info) {
+		// TEMPORARY INSTRUMENTATION - count all inbound datagrams before any parsing
+		if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+		globalThis.__ATTPERF.udpPackets++;
+		globalThis.__ATTPERF.udpBytes += message.length;
+
 		try {
 			// parse message into JSON
 			let parsed = JSON.parse(message.toString());
@@ -86,6 +91,15 @@ class UDPManager {
 			// validate structure of the incoming packet
 			const isValid = this.validateIncomingPacket(parsed);
 			if (!isValid) return; // ignore bad packets
+
+			// Attach the sender's address before emitting. The box has always
+			// known every Emit's IP - handleMessage receives it in `info` and
+			// the detail log below prints it - but it was dropped on the floor
+			// here, so nothing downstream could unicast to a device that had
+			// just announced itself. Underscore-prefixed because it comes from
+			// the transport, not from the JSON on the wire, and must never be
+			// confused with a field a device claimed about itself.
+			parsed._SOURCE_IP = info.address;
 
 			// emit the validated packet to the entire system
 			eventHub.emit('receivedUDP', parsed);

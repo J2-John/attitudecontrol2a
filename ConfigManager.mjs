@@ -31,6 +31,22 @@ class ConfigManager {
 		this.config = {};
 		this.filePath = CONFIG_FILE_PATH + 'config.json';
 
+		// The exact string we last wrote to disk, used to skip writes when nothing changed.
+		// saveToFile() is called on every sync, so without this the whole file is rewritten
+		// once per second even when byte-identical.
+		//
+		// HISTORY, so this does not get lost a second time: this guard was added in 09192e9
+		// ("Reduce SD wear"), which took measured writes from 4,545 MB/day to 0. It was then
+		// deleted in 02a7061 ("Config hash protocol, and four updater fixes"), which had
+		// nothing to do with it - an accidental revert in a merge. The regression went
+		// unnoticed for a day because the config-hash protocol landed in the same commit and
+		// cut writes to ~2,553 MB/day, so the number still looked like an improvement.
+		// Restored 2026-08-10 after measuring 2,553 MB/day on the bench device.
+		//
+		// This is not a micro-optimisation. Continuous rewriting of config.json is the
+		// established cause of the fleet's SD card failures, including AC-0020135.
+		this.lastWrittenSerialized = null;
+
 		// log levels
 		this.logLevels = ['none', 'minimal', 'interval', 'detail'];
 	}
@@ -54,6 +70,10 @@ class ConfigManager {
 
 			// replace current config with the data from the file
 			this.config = JSON.parse(rawData);
+
+			// seed the write guard with the normalized form of what is already on disk, so
+			// an unchanged config after boot does not trigger a pointless rewrite
+			this.lastWrittenSerialized = JSON.stringify(this.config, null, 2);
 
 			// log success
 			logger.info('Successfully loaded configuration data from local JSON file!');
@@ -89,8 +109,30 @@ class ConfigManager {
 				logger.info('Saving configuration to file...');
 			}
 
-			// actually write the config to a file
-			fs.writeFileSync(this.filePath, JSON.stringify(this.config, null, 2));
+			// Serialize once, then skip the write entirely if it matches what is already on
+			// disk. The server sends the full config on a change and this function is called
+			// on every sync, so the overwhelming majority of these calls write identical
+			// bytes. See the note on lastWrittenSerialized in the constructor before removing.
+			const serialized = JSON.stringify(this.config, null, 2);
+
+			if (serialized === this.lastWrittenSerialized) {
+				// nothing changed - don't touch the SD card
+				if (this.checkLogLevel('detail')) {
+					logger.info('Configuration unchanged, skipping write to file.');
+				}
+
+				return;
+			}
+
+			// Write to a temporary file first, then rename over the real one. rename is
+			// atomic, so losing power mid-write cannot leave a truncated config.json that
+			// fails to parse on next boot.
+			const tempPath = this.filePath + '.tmp';
+			fs.writeFileSync(tempPath, serialized);
+			fs.renameSync(tempPath, this.filePath);
+
+			// only record it as written after both steps succeeded
+			this.lastWrittenSerialized = serialized;
 
 			// log success
 			if (this.checkLogLevel('detail')) {
@@ -254,6 +296,20 @@ class ConfigManager {
 	getAttitudeEmits() {
 		return this.config.attitudeEmits ?? [];
 	}
+
+	// suppressSacnMulticast - may this location stop multicasting sACN?
+	//
+	// Defaults to FALSE, and the default is the whole point. Third-party sACN
+	// receivers are in use at many locations and they appear nowhere in
+	// attitudeEmits, so "every Emit assigned here is an Emit-8" says nothing
+	// about who else is listening on 239.255.x.x. Suppressing multicast on that
+	// inference would take out equipment this box does not know exists.
+	//
+	// Set it per location only once someone has confirmed nothing else at that
+	// site consumes multicast sACN.
+	getSuppressSacnMulticast() {
+		return this.config.suppressSacnMulticast === true;
+	}
 	
 	// webOverrides
 	getWebOverrides() {
@@ -309,6 +365,15 @@ class ConfigManager {
 	}
 
 
+
+
+	// the fingerprint of the config the server last sent us. Echoed back on every sync so the
+	// server can answer "nothing changed" in a few hundred bytes instead of resending the
+	// whole configuration. Null on a device that has never received one, which makes the
+	// server send everything - so a device with no hash is always correct, just chattier.
+	getConfigHash() {
+		return this.config?.configHash ?? null;
+	}
 
 
 	// get the config file path
