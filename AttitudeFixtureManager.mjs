@@ -16,6 +16,7 @@ import eventHub from './EventHub.mjs';
 import configManager from './ConfigManager.mjs';
 import attitudeScheduler from './AttitudeScheduler.mjs';
 import attitudeSACN from './AttitudeSACN2A.mjs';
+import showTableStore, { isDeviceRenderable } from './ShowTableStore.mjs';
 
 // import engine
 import { AttitudeEngine3 } from './AttitudeEngine3.mjs';
@@ -28,6 +29,30 @@ import { TRANSITIONS } from './Transitions.js';
 // ==================== VARIABLES ====================
 const DMX_FRAME_INTERVAL = 25;  // interval speed in milliseconds for each DMX frame (should be 25ms)
 const GAMMA = 1.7;
+
+// Precomputed gamma curve (perf, 2026-08).
+// applyGamma() ran Math.pow four times per segment per engine per frame - on a 79 segment
+// site with 4 engines that is over 1,200 pow calls every 25 ms, and pow is a library call
+// on the A53. Every input is an integer 0-255 (engine colours are validated integers and
+// every fade result is Math.round'ed), so the whole domain fits in a 256 entry table and
+// the lookup is exact, not an approximation. Verified identical for all 256 inputs.
+// Anything outside that domain still takes the original path.
+const GAMMA_TABLE = new Uint8Array(256);
+for (let i = 0; i < 256; i++) {
+	GAMMA_TABLE[i] = Math.round(Math.pow(i / 255, GAMMA) * 255);
+}
+
+
+// ==================== TEMPORARY PERFORMANCE INSTRUMENTATION ====================
+// Added 2026-08 to diagnose low frame rates. Times each phase of processFixtures and
+// reports a rolling 1-second summary through the existing moduleStatus channel.
+// ADDITIVE ONLY - no behaviour is changed. Remove once the cause is identified.
+if (!globalThis.__ATTPERF) { globalThis.__ATTPERF = { udpPackets: 0, udpBytes: 0, schedCalls: 0, schedNs: 0n, senseTriggers: 0 }; }
+const PERF = {
+    frames: 0, cfg: 0n, uniq: 0n, gen: 0n, eng: 0n, patch: 0n,
+    total: 0n, maxTotal: 0n, windowStart: 0n, lastCall: 0n, maxGap: 0n,
+    report: 'PERF warming up...'
+};
 
 
 
@@ -78,19 +103,74 @@ class AttitudeFixtureManager {
     		// check if we are assigned to a location or not
     		if (configManager.getAssignedToLocation()) {
 	    		// get fixtures/zones/shows configManager and schedule from attitudeScheduler
+	        	const _t0 = process.hrtime.bigint();
+	        	if (PERF.lastCall !== 0n) {
+	        		const _gap = _t0 - PERF.lastCall;
+	        		if (_gap > PERF.maxGap) { PERF.maxGap = _gap; }
+	        	}
+	        	PERF.lastCall = _t0;
+
 	        	this.getConfigration();
+	        	const _t1 = process.hrtime.bigint();
 
 	        	// find unique show IDs in schedule
 				this.uniqueShowIds = this.findUniqueNumbers(this.schedule);
+				const _t2 = process.hrtime.bigint();
 
 				// generate/remove engine instances if needed
 				this.generateEngineInstances();
+				const _t3 = process.hrtime.bigint();
+
+				// advance every show table by one frame, before anything reads them, so all
+				// groups playing the same show stay in phase with each other
+				showTableStore.advance();
 
 				// process each engine instance, updating engine config if necesary and running engine
 				this.processEngineInstances();
+				const _t4 = process.hrtime.bigint();
 
 	        	// process the patch and schedule, then grab the output data from the engine and apply it to DMX
 	        	this.processPatchAndOutputShows();
+	        	const _t5 = process.hrtime.bigint();
+
+	        	PERF.frames++;
+	        	PERF.cfg += (_t1 - _t0);
+	        	PERF.uniq += (_t2 - _t1);
+	        	PERF.gen += (_t3 - _t2);
+	        	PERF.eng += (_t4 - _t3);
+	        	PERF.patch += (_t5 - _t4);
+	        	const _tot = _t5 - _t0;
+	        	PERF.total += _tot;
+	        	if (_tot > PERF.maxTotal) { PERF.maxTotal = _tot; }
+	        	if (PERF.windowStart === 0n) { PERF.windowStart = _t0; }
+	        	if ((_t5 - PERF.windowStart) >= 1000000000n) {
+	        		const _n = BigInt(PERF.frames || 1);
+	        		const _avg = function (v) { return (Number(v / _n) / 1e6).toFixed(2); };
+	        		PERF.report = 'PERF renderfps=' + PERF.frames
+	        			+ ' cfg=' + _avg(PERF.cfg)
+	        			+ ' uniq=' + _avg(PERF.uniq)
+	        			+ ' gen=' + _avg(PERF.gen)
+	        			+ ' eng=' + _avg(PERF.eng)
+	        			+ ' patch=' + _avg(PERF.patch)
+	        			+ ' total=' + _avg(PERF.total)
+	        			+ ' maxframe=' + (Number(PERF.maxTotal) / 1e6).toFixed(2)
+	        			+ ' maxgap=' + (Number(PERF.maxGap) / 1e6).toFixed(1)
+	        			+ ' engines=' + this.engineInstances.length
+	        			+ ' segs=' + (this.fixtures ? this.fixtures.length : 0)
+	        			+ ' udp=' + globalThis.__ATTPERF.udpPackets
+	        			+ ' udpkb=' + (globalThis.__ATTPERF.udpBytes / 1024).toFixed(1)
+	        			+ ' sched=' + globalThis.__ATTPERF.schedCalls
+	        			+ ' schedms=' + (Number(globalThis.__ATTPERF.schedNs) / 1e6).toFixed(1)
+	        			+ ' sense=' + globalThis.__ATTPERF.senseTriggers
+	        			+ ' ' + showTableStore.summary();
+	        		globalThis.__ATTPERF.udpPackets = 0; globalThis.__ATTPERF.udpBytes = 0;
+	        		globalThis.__ATTPERF.schedCalls = 0; globalThis.__ATTPERF.schedNs = 0n;
+	        		globalThis.__ATTPERF.senseTriggers = 0;
+	        		showTableStore.resetWindow();
+	        		PERF.frames = 0; PERF.cfg = 0n; PERF.uniq = 0n; PERF.gen = 0n;
+	        		PERF.eng = 0n; PERF.patch = 0n; PERF.total = 0n;
+	        		PERF.maxTotal = 0n; PERF.maxGap = 0n; PERF.windowStart = _t5;
+	        	}
 
 	    		// log the interval
 	    		if (configManager.checkLogLevel('detail')) {
@@ -101,7 +181,7 @@ class AttitudeFixtureManager {
 		        eventHub.emit('moduleStatus', { 
 		            name: 'AttitudeFixtureManager', 
 		            status: 'operational',
-		            data: 'Processed fixtures/shows/schedule and sent DMX to AttitudeSACN module!',
+		            data: PERF.report,
 		        });
 		    } else {
 		    	// otherwise we aren't assigned to a location, so set everything to white
@@ -144,6 +224,29 @@ class AttitudeFixtureManager {
 		this.fixtures = configManager.getFixtures();
 		this.shows = configManager.getShows();
 		this.schedule = attitudeScheduler.getFinalSchedule();
+
+		// The location's fallback show: what plays when a SERVER-ONLY show has no table yet.
+		// It must be a show this device can render itself. Anything missing or unrenderable
+		// leaves this null, and the not-found path takes over (white), which is what an
+		// unassigned device already does.
+		this.fallbackShowId = null;
+		const configuredFallback = configManager.getFallbackShowId
+			? configManager.getFallbackShowId()
+			: (configManager.config ? configManager.config.fallbackShowId : null);
+		if (configuredFallback) {
+			const fallbackShow = this.shows.find(itm => itm.id === configuredFallback);
+			if (fallbackShow && isDeviceRenderable(fallbackShow)) {
+				this.fallbackShowId = configuredFallback;
+			}
+		}
+
+		// Tell the table store which shows we could render ourselves, so it applies the
+		// fingerprint check only where divergence is actually possible.
+		const renderable = new Map();
+		for (const show of this.shows) {
+			if (show && show.id !== undefined) renderable.set(Number(show.id), isDeviceRenderable(show));
+		}
+		showTableStore.setRenderableShows(renderable);
 	}
 
 
@@ -235,22 +338,72 @@ class AttitudeFixtureManager {
 			return;
 		}
 
-		// get the engineInstance for this show id
+		// calculate all fixture segments (handling single, multicount, and segmented fixtures).
+	    // Computed before anything else now, because the segment count is what identifies a
+	    // show table and therefore what decides whether a server-only show can play at all.
+	    let fixtureSegments = this.calculateAllFixtureSegments(fixtures);
+
+	    // SHOW GENERATIONS.
+	    // A show this device's engine cannot render is SERVER-ONLY: we play its table, or we
+	    // substitute the location's fallback show. We never attempt to render one, which is what
+	    // stops a new show type placing any new, untested load on field hardware - and is what
+	    // lets new show types ship as a server deploy instead of a fleet firmware rollout.
+	    const thisShow = this.shows ? this.shows.find(itm => itm.id === showId) : undefined;
+	    if (!(showId == 0) && thisShow && !isDeviceRenderable(thisShow)) {
+	    	showTableStore.registerNeed(showId, fixtureSegments.length);
+
+	    	// offsetFor is a non-counting existence check, so this does not skew hit/miss
+	    	if (showTableStore.offsetFor(showId, fixtureSegments.length) < 0) {
+	    		showId = (this.fallbackShowId && this.fallbackShowId !== showId)
+	    			? this.fallbackShowId
+	    			: -1;
+	    	}
+	    }
+
+	    // get the engineInstance for this show id
 	    let engineInstance = this.engineInstances.find(itm => itm.showId === showId);
 
 	    // check if it's undefined
 	    if (engineInstance == undefined && !(showId == 0)) {
+	    	// A server-only show with no table and no usable fallback lands here. Output white,
+	    	// matching what an unassigned device and a not-found show already do, rather than
+	    	// throwing on every frame.
+	    	if (showId === -1) {
+	    		for (const seg of fixtureSegments) {
+	    			attitudeSACN.set(seg.universe, seg.startAddress, 255);
+	    			attitudeSACN.set(seg.universe, seg.startAddress + 1, 255);
+	    			attitudeSACN.set(seg.universe, seg.startAddress + 2, 255);
+	    			if (seg.colorMode == 'RGBW') attitudeSACN.set(seg.universe, seg.startAddress + 3, 255);
+	    		}
+	    		return;
+	    	}
+
 	    	throw new Error(`Unable to find an engne instance for show id ${showId}!`);
 	    }
-
-	    // calculate all fixture segments (handling single, multicount, and segmented fixtures)
-	    let fixtureSegments = this.calculateAllFixtureSegments(fixtures);
 
 	    // set the number of total segments to calculate for,
 	    // as long as the show id is not zero. If it's zero, we're just outputting black to all anyway.
 	    if (!(showId == 0)) {
 		    engineInstance.engine.setFixtureCount(fixtureSegments.length);
 		}
+
+	    // Server-rendered table for this show at this exact segment count, if we have one.
+	    // Tables already carry gamma and the white channel, so playback is a straight copy.
+	    // A null here is completely normal - it just means render locally, as we always have.
+	    let table = null;
+	    let tableOffset = -1;
+	    if (!(showId == 0)) {
+	    	showTableStore.registerNeed(showId, fixtureSegments.length);
+	    	table = showTableStore.get(showId, fixtureSegments.length);
+	    	if (table) {
+	    		tableOffset = showTableStore.offsetFor(showId, fixtureSegments.length);
+	    		// a frame that does not fit is not trusted - fall back rather than read past
+	    		// the end of the buffer
+	    		if (tableOffset < 0 || tableOffset + fixtureSegments.length * 4 > table.buf.length) {
+	    			table = null;
+	    		}
+	    	}
+	    }
 
 	    // now try to apply this show to the fixtures by iterating over each
 		try {
@@ -265,15 +418,29 @@ class AttitudeFixtureManager {
 
 				// if the current show id isn't zero
 				if (!(showId == 0)) {
-					// get the color corresponding to this pixel
-					thisFixtureColor = engineInstance.engine.getFixtureColor(index);
+					if (table) {
+						// PLAYBACK: copy the pre-rendered frame, already gamma corrected
+						const o = tableOffset + index * 4;
+						thisFixtureColor = {
+							red: table.buf[o],
+							green: table.buf[o + 1],
+							blue: table.buf[o + 2],
+							white: table.buf[o + 3],
+						};
+					} else {
+						// RENDER: the original path, unchanged
+						thisFixtureColor = engineInstance.engine.getFixtureColor(index);
 
-					// process a white value for this color from RGB
-					thisFixtureColor.white = this.calculateWhiteFromRGB(thisFixtureColor);
+						// process a white value for this color from RGB
+						thisFixtureColor.white = this.calculateWhiteFromRGB(thisFixtureColor);
+
+						// now run a gamma curve function on this color
+						thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
+					}
+				} else {
+					// show id zero is black, still passed through gamma exactly as before
+					thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
 				}
-
-				// now run a gamma curve function on this color
-				thisFixtureColor = this.calculateColorGamma(thisFixtureColor);
 
 				// check if this fixture should be highlighted
 				if (fixtureSegment.highlight) {
@@ -503,15 +670,28 @@ class AttitudeFixtureManager {
 		        });
 			}
 
-		    // now actually run the engine to process colors
-		    engineInstance.engine.run();
+		    // Now actually run the engine to process colors - unless every group playing this
+		    // show already has a server-rendered table, in which case rendering is pure waste.
+		    // The frame counter is still advanced so that if a table later goes missing and we
+		    // fall back to rendering, the show resumes in phase instead of jumping.
+		    if (showTableStore.isFullyCovered(engineInstance.showId)) {
+		    	engineInstance.engine.incrementFrameCounter();
+		    } else {
+		    	engineInstance.engine.run();
+		    }
 		});
 	}
 
 
 	// generateEngineInstances - generate any new engineInstances needed, and remove any not needed, based on this.uniqueShowIds
 	generateEngineInstances() {
-	    const uniqueIdSet = new Set(this.uniqueShowIds);
+	    // The fallback show needs a live engine even when the schedule never mentions it,
+	    // otherwise substituting to it would find no engine instance and throw.
+	    const wanted = this.uniqueShowIds.slice();
+	    if (this.fallbackShowId && wanted.indexOf(this.fallbackShowId) === -1) {
+	    	wanted.push(this.fallbackShowId);
+	    }
+	    const uniqueIdSet = new Set(wanted);
 
 	    // Create a map of current engineInstances for quick lookup
 	    const showMap = new Map();
@@ -523,7 +703,7 @@ class AttitudeFixtureManager {
 	    this.engineInstances = this.engineInstances.filter(show => uniqueIdSet.has(show.showId));
 
 	    // Add new items for each id in uniqueIds if not already present
-	    this.uniqueShowIds.forEach(id => {
+	    wanted.forEach(id => {
 	        if (!showMap.has(id)) {
 	        	// create the engine object
 	        	// whatever config is here will be the default for any invalid shows (ie. 1st gen engine shows)
@@ -540,6 +720,10 @@ class AttitudeFixtureManager {
 		                { red: 128, green: 128, blue: 128 },
 		            ]
 		        });
+
+		        // the engine derives every show's animation speed from the frame duration,
+		        // so tell it what we actually render at rather than letting it assume
+		        engine.setFrameInterval(DMX_FRAME_INTERVAL);
 
 		        // now push this to the engineInstances list
 	            this.engineInstances.push({
@@ -599,6 +783,12 @@ class AttitudeFixtureManager {
 
 	// actually apply gamma to a value
 	applyGamma(value) {
+		// table lookup for the normal case (integer 0-255), identical result
+		if (Number.isInteger(value) && value >= 0 && value <= 255) {
+			return GAMMA_TABLE[value];
+		}
+
+		// anything else keeps the original behaviour exactly
   		return Math.round(Math.pow(value / 255, GAMMA) * 255);
 	}
 }

@@ -6,6 +6,8 @@
 
 
 // import modules
+import fs from 'fs';
+
 import eventHub from './EventHub.mjs';
 import attitudeLED from './AttitudeLED2A.mjs';
 import attitudeSACN from './AttitudeSACN2A.mjs';
@@ -21,6 +23,34 @@ import configManager from './ConfigManager.mjs';
 const SAMPLE_INTERVAL = 3000;  // interval for how often to check module statuses (should be 15000ms)
 const SEND_TO_NETWORK_INTERVAL = 15000; // interval for how often to send module statuses to the server
 const UNRESPONSIVE_THRESHOLD = 35;  // number of seconds before considering a module unresponsive
+
+
+
+// ---------------------------------------------------------------------------
+// LOCAL STATUS FILE
+//
+// The same status we send to the server, also written to a local file so that update.sh
+// can read it. update.sh is a shell script with no way to see inside this process, so
+// before this file existed the only things it could check after an update were that the
+// pid stayed up and that a socket was open on :443.
+//
+// Both of those were true on 2026-08-11 while AttitudeFixtureManager threw on every single
+// frame. The update passed its health check, no rollback fired, and the lights stopped.
+// A false pass is worse than a failure, so this closes that hole: the updater can now
+// require positive proof that fixtures are actually being processed before it accepts a
+// build. It also catches a wedged event loop, which the socket check cannot - the
+// WebSocket stays open whether or not anything is still running.
+//
+// WRITTEN TO A MEMORY-BACKED FILESYSTEM, NEVER THE SD CARD. Repeatedly rewriting a small
+// file in place is the established cause of card failure on this fleet (AC-0020135, on
+// config.json). At one write every SAMPLE_INTERVAL this would be ~29k writes a day to the
+// same erase block. /dev/shm is tmpfs on every image we run; /tmp is the fallback.
+//
+// Deliberately NOT JSON: the only consumer is a bash script on a device with no jq.
+// ---------------------------------------------------------------------------
+const LOCAL_STATUS_MARKER = 'ATTITUDE_STATUS_FILE_V1';   // update.sh greps this file, and this source, for this exact string
+const LOCAL_STATUS_FILENAME = 'attitude-status';
+const LOCAL_STATUS_DIRS = ['/dev/shm', '/run/shm', '/tmp'];
 
 
 
@@ -41,6 +71,12 @@ class ModuleStatusTracker {
         // variable to hold the timestamp for the last sent packet
         // initial value needs to be current time minus send interval, so that the first packet will send
         this.lastStatusSentToNetworkTimestamp = (new Date() - SEND_TO_NETWORK_INTERVAL);
+
+        // where the local status file is being written, resolved on first write
+        this.localStatusPath = null;
+
+        // set once we have given up on writing it, so we do not retry every sample forever
+        this.localStatusUnavailable = false;
 
         // bind an event listener for each moduleStatus event
         eventHub.on('moduleStatus', this.moduleStatusListener.bind(this));
@@ -109,6 +145,9 @@ class ModuleStatusTracker {
             // console.log('currentModuleStatus', currentModuleStatus);
 
 
+            // write the same picture to a local file, for update.sh to health check against
+            this.writeLocalStatusFile(currentModuleStatus);
+
             // calculate the difference between the current time and the last time we sent data to the network
             let difference = new Date() - this.lastStatusSentToNetworkTimestamp;
 
@@ -122,6 +161,139 @@ class ModuleStatusTracker {
             }            
         } catch (error) {
             logger.error(`Error processing status of all modules: ${error}`);
+        }
+    }
+
+
+    // isMemoryBacked - is this directory on a tmpfs/ramfs mount?
+    //
+    // The entire reason this file is not written to the SD card is erase-block wear: at one
+    // write per sample it is roughly 29,000 writes a day to the same few blocks, which is how
+    // AC-0020135's card died by way of config.json. A fallback that silently lands on the card
+    // would give that back without anyone noticing, so each candidate directory is checked
+    // rather than assumed. /dev/shm and /run/shm are tmpfs everywhere we run; /tmp is only
+    // sometimes, and this is what tells the difference.
+    //
+    // If we cannot tell, the answer is no. Losing this diagnostic costs an update rollback,
+    // which is visible and recoverable. Being wrong the other way costs a card.
+    isMemoryBacked(dir) {
+        try {
+            const mounts = fs.readFileSync('/proc/mounts', 'utf8').split('\n');
+
+            // longest matching mount point wins - /dev/shm must not be judged by /
+            let best = null;
+            for (const line of mounts) {
+                const parts = line.split(' ');
+                if (parts.length < 3) { continue; }
+
+                const point = parts[1];
+                const type = parts[2];
+                const prefix = (point === '/') ? '/' : point + '/';
+
+                if (dir === point || dir.indexOf(prefix) === 0) {
+                    if (best === null || point.length > best.point.length) {
+                        best = { point: point, type: type };
+                    }
+                }
+            }
+
+            return best !== null && (best.type === 'tmpfs' || best.type === 'ramfs');
+        } catch (error) {
+            return false;
+        }
+    }
+
+
+    // resolveLocalStatusPath - pick the first memory-backed directory we can actually write to.
+    // Resolved once, at the first write, rather than at import time: this module is constructed
+    // while the app is still starting up and a throw there would take the whole app down.
+    resolveLocalStatusPath() {
+        for (const dir of LOCAL_STATUS_DIRS) {
+            if (!this.isMemoryBacked(dir)) { continue; }
+
+            const candidate = dir + '/' + LOCAL_STATUS_FILENAME;
+            try {
+                fs.writeFileSync(candidate + '.probe', LOCAL_STATUS_MARKER);
+                fs.unlinkSync(candidate + '.probe');
+                return candidate;
+            } catch (error) {
+                // try the next one
+            }
+        }
+        return null;
+    }
+
+
+    // writeLocalStatusFile - write the current status where update.sh can read it.
+    //
+    // Best effort in every sense: this is a diagnostic, and nothing about the running of the
+    // lights depends on it. Any failure is swallowed so that a full or read-only filesystem
+    // cannot stop us reporting status to the server, which matters far more.
+    writeLocalStatusFile(currentModuleStatus) {
+        if (this.localStatusUnavailable) { return; }
+
+        try {
+            if (this.localStatusPath === null) {
+                this.localStatusPath = this.resolveLocalStatusPath();
+
+                if (this.localStatusPath === null) {
+                    this.localStatusUnavailable = true;
+                    logger.warn('Could not write a local status file to any of ' + LOCAL_STATUS_DIRS.join(', ') + ' - update.sh will not be able to health check rendering on this device');
+                    return;
+                }
+            }
+
+            // frames rendered in the last second, lifted out of the fixture manager's PERF
+            // report. This is the positive proof the updater is after: not "the process is
+            // alive" but "fixtures were processed". -1 means we do not know yet, which is
+            // normal for the first second after a restart.
+            let renderFps = -1;
+            const fixtureModule = this.findModuleByName('AttitudeFixtureManager');
+            if (fixtureModule && typeof fixtureModule.data === 'string') {
+                const match = fixtureModule.data.match(/renderfps=(\d+)/);
+                if (match) { renderFps = Number(match[1]); }
+            }
+
+            // An unassigned device legitimately never renders anything - it outputs white and
+            // reports operational. The updater has to know the difference, or it would roll
+            // back every good build on a device that has not been assigned to a location yet.
+            // -1 on failure, NOT 0.
+            //
+            // The updater treats assigned=0 as "legitimately not rendering - pass without
+            // requiring frames", which is the escape hatch for a device with no location. If
+            // a build that breaks config loading also reported 0, that escape hatch would
+            // become the error path, and the updater would pass exactly the build it should
+            // reject. -1 is neither, so it falls through to needing a real frame rate.
+            let assigned = -1;
+            try {
+                assigned = configManager.getAssignedToLocation() ? 1 : 0;
+            } catch (error) {
+                assigned = -1;
+            }
+
+            let contents = 'marker=' + LOCAL_STATUS_MARKER + '\n'
+                + 'epoch=' + Math.floor(Date.now() / 1000) + '\n'
+                + 'at=' + new Date().toISOString() + '\n'
+                + 'overall=' + this.overallStatus + '\n'
+                + 'assigned=' + assigned + '\n'
+                + 'renderfps=' + renderFps + '\n';
+
+            for (const module of currentModuleStatus.modules) {
+                // one line per module, names are ours and contain no spaces or newlines
+                contents += 'mod.' + module.name + '=' + module.status + '\n';
+            }
+
+            // write and rename, so the updater can never read a half-written file
+            const tempPath = this.localStatusPath + '.tmp';
+            fs.writeFileSync(tempPath, contents);
+            fs.renameSync(tempPath, this.localStatusPath);
+        } catch (error) {
+            // Do NOT give up on a write failure. A transient one - a full /tmp, a directory
+            // that went away - would otherwise leave a stale file behind forever, and a stale
+            // file reads to the updater as a dead device and would roll back a good build.
+            // Drop the resolved path so the next sample picks a directory again.
+            this.localStatusPath = null;
+            logger.warn(`Could not write the local status file: ${error.message}`);
         }
     }
 
