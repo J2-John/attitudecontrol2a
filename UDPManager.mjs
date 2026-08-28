@@ -92,6 +92,15 @@ class UDPManager {
 			const isValid = this.validateIncomingPacket(parsed);
 			if (!isValid) return; // ignore bad packets
 
+			// Attach the sender's address before emitting. The box has always
+			// known every Emit's IP - handleMessage receives it in `info` and
+			// the detail log below prints it - but it was dropped on the floor
+			// here, so nothing downstream could unicast to a device that had
+			// just announced itself. Underscore-prefixed because it comes from
+			// the transport, not from the JSON on the wire, and must never be
+			// confused with a field a device claimed about itself.
+			parsed._SOURCE_IP = info.address;
+
 			// emit the validated packet to the entire system
 			eventHub.emit('receivedUDP', parsed);
 

@@ -296,6 +296,20 @@ class ConfigManager {
 	getAttitudeEmits() {
 		return this.config.attitudeEmits ?? [];
 	}
+
+	// suppressSacnMulticast - may this location stop multicasting sACN?
+	//
+	// Defaults to FALSE, and the default is the whole point. Third-party sACN
+	// receivers are in use at many locations and they appear nowhere in
+	// attitudeEmits, so "every Emit assigned here is an Emit-8" says nothing
+	// about who else is listening on 239.255.x.x. Suppressing multicast on that
+	// inference would take out equipment this box does not know exists.
+	//
+	// Set it per location only once someone has confirmed nothing else at that
+	// site consumes multicast sACN.
+	getSuppressSacnMulticast() {
+		return this.config.suppressSacnMulticast === true;
+	}
 	
 	// webOverrides
 	getWebOverrides() {
