@@ -1,7 +1,7 @@
 {
   "type": "module",
   "scripts": {
-    "test": "node --test --test-force-exit test/"
+    "test": "node --test --test-force-exit \"test/*.test.mjs\""
   },
   "dependencies": {
     "e131": "^1.1.3",
