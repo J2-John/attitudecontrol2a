@@ -57,6 +57,11 @@ class AttitudeSACN {
 		// resolves it to its multicast group) and a string as a literal host.
 		this.clientsByHost = new Map();
 		this.routes = [];
+
+		// One sequence number per universe, owned here rather than by the e131
+		// client - see processDMX for why that distinction matters once a
+		// universe has more than one destination.
+		this.sequenceNumbers = [];
 		
 		// Default number of universes, can be changed in initialize
 		this.universes = 4;
@@ -116,6 +121,7 @@ class AttitudeSACN {
 				const multicastHost = multicastGroupFor(i + 1);
 				this.routes[i] = [multicastHost];
 				this.clients[i] = this.getClient(multicastHost);
+				this.sequenceNumbers[i] = 0;
 
 				// Create a packet for each client
 				this.packets[i] = this.clients[i].createPacket(512);
@@ -271,19 +277,41 @@ class AttitudeSACN {
 					}
 				}
 
-				// Send this universe's packet to every destination routed to it.
-				// One packet object, several sockets: e131's send() bumps the
-				// packet's sequence number in its own callback, so each receiver
-				// sees the sequence step by the number of destinations. E1.31
-				// 6.7.2 only discards sequence differences in [-20, 0], so a
-				// forward step of two or three is accepted everywhere.
+				// THE SEQUENCE NUMBER IS OURS, not the library's.
+				//
+				// e131's Client.send() calls packet.incrementSequenceNumber()
+				// inside its own send callback. With one destination that is
+				// exactly right. With N destinations it fires N times per frame,
+				// so the sequence advances by N per frame instead of by 1.
+				//
+				// That is wrong twice over. By E1.31 the sequence number belongs
+				// to the source and universe, not to a delivery - the same frame
+				// sent to two places is one packet delivered twice, and both
+				// receivers should see the same number. And it breaks the only
+				// loss diagnostic an Emit-8 has: its parser counts a difference
+				// greater than 1 as missing packets, because on that hardware a
+				// sequence hole is the ONLY evidence of a dropped datagram (the
+				// W6300 has no receive-overflow flag). A location with an Emit-8
+				// and an Emit-1 has two destinations on that universe, so a
+				// perfectly healthy link would report 50% packet loss forever,
+				// on exactly the mixed sites where the number matters most.
+				//
+				// So the counter is kept here and stamped before each frame. The
+				// library's post-send increment still happens and is simply
+				// overwritten next frame. With a single destination the observable
+				// behaviour is byte-for-byte what it has always been: +1 a frame.
 				const hosts = this.routes[u] || [];
-				for (let d = 0; d < hosts.length; d++) {
-					const client = this.clientsByHost.get(hosts[d]);
-					if (!client) continue;
-					client.send(this.packets[u], () => {
-						// Sent callback
-					});
+				if (hosts.length > 0) {
+					this.packets[u].setSequenceNumber(this.sequenceNumbers[u]);
+					this.sequenceNumbers[u] = (this.sequenceNumbers[u] + 1) & 0xFF;
+
+					for (let d = 0; d < hosts.length; d++) {
+						const client = this.clientsByHost.get(hosts[d]);
+						if (!client) continue;
+						client.send(this.packets[u], () => {
+							// Sent callback
+						});
+					}
 				}
 			}
 
