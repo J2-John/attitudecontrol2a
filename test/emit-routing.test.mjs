@@ -17,9 +17,9 @@ const { default: emitManager }   = await import('../AttitudeEmitManager.mjs');
 
 const MULTICAST = u => `239.255.0.${u}`;
 
-function setConfig(emits, suppressMulticast = false) {
+function setConfig(emits, forceMulticast = false) {
     configManager.getAttitudeEmits = () => emits;
-    configManager.getSuppressSacnMulticast = () => suppressMulticast;
+    configManager.getForceSacnMulticast = () => forceMulticast;
 }
 
 function discover(id, ip, name, universes) {
@@ -47,51 +47,54 @@ test('no Emit-8 at this location: multicast, exactly as before', () => {
     assert.deepEqual(routes[1], [null], 'unassigned universes still multicast');
 });
 
-test('Emit-8 only, location NOT opted out: unicast AND multicast', () => {
-    // The default, and the one that matters most. Third-party sACN receivers
-    // exist at many locations and appear nowhere in attitudeEmits, so an
-    // all-Emit-8 assignment list is not evidence that nothing else is
-    // listening. Multicast stays until a human says otherwise.
+test('Emit-8 only: unicast only, no flag needed', () => {
+    // The rule, and the one that matters most. A location that HAS an Emit-8
+    // never has third-party sACN gear on it - a deployment rule, not something
+    // inferred from the assignment list - so multicast drops on its own.
     reset();
     setConfig([{ id: 7, assigned_universes: [1, 2, 3, 4], model: 'Emit-8' }]);
     discover(7, '10.0.0.77', 'Emit-8', [1, 2, 3, 4]);
 
     const { routes, keepMulticast } = emitManager.computeRoutes(4);
-    assert.equal(keepMulticast, true, 'third-party receivers must not be cut off');
+    assert.equal(keepMulticast, false, 'an all-Emit-8 location drops multicast');
+    for (let u = 0; u < 4; u++) {
+        assert.deepEqual(routes[u], ['10.0.0.77'], `universe ${u + 1} unicast only`);
+    }
+});
+
+test('Emit-8 only, location pinned to multicast: unicast AND multicast', () => {
+    // The escape hatch for a site that turns out to be an exception. Pins it
+    // back to today's behaviour with a config value, not a firmware change.
+    reset();
+    setConfig([{ id: 7, assigned_universes: [1, 2, 3, 4], model: 'Emit-8' }], true);
+    discover(7, '10.0.0.77', 'Emit-8', [1, 2, 3, 4]);
+
+    const { routes, keepMulticast } = emitManager.computeRoutes(4);
+    assert.equal(keepMulticast, true, 'forceSacnMulticast wins over the rule');
     for (let u = 0; u < 4; u++) {
         assert.deepEqual(routes[u], ['10.0.0.77', null],
             `universe ${u + 1} unicast plus multicast`);
     }
 });
 
-test('Emit-8 only, location opted out: unicast only', () => {
-    reset();
-    setConfig([{ id: 7, assigned_universes: [1, 2, 3, 4], model: 'Emit-8' }], true);
-    discover(7, '10.0.0.77', 'Emit-8', [1, 2, 3, 4]);
-
-    const { routes, keepMulticast } = emitManager.computeRoutes(4);
-    assert.equal(keepMulticast, false, 'opted out and every Emit-8 reachable');
-    for (let u = 0; u < 4; u++) {
-        assert.deepEqual(routes[u], ['10.0.0.77'], `universe ${u + 1} unicast only`);
-    }
-});
-
-test('opted out but an Emit-1 is present: multicast stays', () => {
+test('an Emit-1 at the same location keeps multicast', () => {
+    // Nothing else feeds an Emit-1. This is the guard that has to hold even
+    // though the location does have an Emit-8 on it.
     reset();
     setConfig([
         { id: 7, assigned_universes: [1], model: 'Emit-8' },
         { id: 3, assigned_universe: 2,   model: 'Emit-1' },
-    ], true);
+    ]);
     discover(7, '10.0.0.77', 'Emit-8', [1]);
     discover(3, '10.0.0.53', 'Attitude Emit', [2]);
 
     const { keepMulticast } = emitManager.computeRoutes(2);
-    assert.equal(keepMulticast, true, 'the opt-out does not override a real Emit-1');
+    assert.equal(keepMulticast, true, 'the Emit-8 rule does not override a real Emit-1');
 });
 
-test('opted out but an Emit-8 has not announced itself: multicast stays', () => {
+test('an Emit-8 that has not announced itself keeps multicast', () => {
     reset();
-    setConfig([{ id: 7, assigned_universes: [1] }, ], true);
+    setConfig([{ id: 7, assigned_universes: [1] }]);
     // not discovered - no address to unicast to
     const { keepMulticast } = emitManager.computeRoutes(1);
     assert.equal(keepMulticast, true, 'any doubt keeps multicast');
@@ -148,15 +151,49 @@ test('model field beats the name a device reports about itself', () => {
 });
 
 test('name is used when the server has not said what the model is', () => {
+    // The web app does not send a model field yet, so until UNIVERSE_SET grows
+    // an array this self-reported name is the ONLY way a box knows it has an
+    // Emit-8 - and it now decides multicast as well as unicast. Worth being
+    // explicit that a device naming itself "Emit-8" is load-bearing.
     reset();
     setConfig([{ id: 9, assigned_universes: [1] }]);   // no model field
     discover(9, '10.0.0.9', 'Emit-8', [1]);
-    // name-based detection still routes unicast; it just does not remove
-    // multicast, because only the opt-out can do that
 
     const { routes, keepMulticast } = emitManager.computeRoutes(1);
-    assert.equal(keepMulticast, true, 'not opted out, so multicast stays');
-    assert.deepEqual(routes[0], ['10.0.0.9', null]);
+    assert.equal(keepMulticast, false, 'the name alone establishes the location has an Emit-8');
+    assert.deepEqual(routes[0], ['10.0.0.9']);
+});
+
+test('two Emit-8s at one location: each unicast, no multicast', () => {
+    reset();
+    setConfig([
+        { id: 7, assigned_universes: [1, 2], model: 'Emit-8' },
+        { id: 8, assigned_universes: [3, 4], model: 'Emit-8' },
+    ]);
+    discover(7, '10.0.0.77', 'Emit-8', [1, 2]);
+    discover(8, '10.0.0.78', 'Emit-8', [3, 4]);
+
+    const { routes, keepMulticast } = emitManager.computeRoutes(4);
+    assert.equal(keepMulticast, false);
+    assert.deepEqual(routes[0], ['10.0.0.77']);
+    assert.deepEqual(routes[3], ['10.0.0.78']);
+});
+
+test('one of two Emit-8s goes silent: multicast comes back for everyone', () => {
+    // Not just for the silent one. keepMulticast is a location-wide decision,
+    // and a universe with no reachable destination has to be reachable somehow.
+    reset();
+    setConfig([
+        { id: 7, assigned_universes: [1, 2], model: 'Emit-8' },
+        { id: 8, assigned_universes: [3, 4], model: 'Emit-8' },
+    ]);
+    discover(7, '10.0.0.77', 'Emit-8', [1, 2]);
+    // id 8 never announces
+
+    const { routes, keepMulticast } = emitManager.computeRoutes(4);
+    assert.equal(keepMulticast, true, 'one silent Emit-8 restores multicast site-wide');
+    assert.deepEqual(routes[0], ['10.0.0.77', null]);
+    assert.deepEqual(routes[3], [null], 'the silent one falls back to multicast');
 });
 
 // -------------------------------------------------- setRoutes never silences
@@ -215,4 +252,156 @@ test('duplicate destinations are collapsed, so no receiver is sent two copies', 
     attitudeSACN.routes = [];
     attitudeSACN.setRoutes([['10.0.0.77', '10.0.0.77', null, null]]);
     assert.deepEqual(attitudeSACN.routes[0], ['10.0.0.77', MULTICAST(1)]);
+});
+
+
+// ------------------------------------------- the sequence number is per frame
+// The bug these pin down: e131's Client.send() increments the packet's
+// sequence number inside its own send callback, so sending one frame to N
+// destinations advances the sequence by N instead of by 1.
+//
+// It matters because of what is downstream. An Emit-8 counts a sequence
+// difference greater than 1 as missing packets - on that hardware a sequence
+// hole is the ONLY evidence of a dropped datagram, since the W6300 has no
+// receive-overflow flag. A location with an Emit-8 AND an Emit-1 has two
+// destinations on that universe, so an unfixed box makes a perfectly healthy
+// link report 50% loss forever, on exactly the mixed sites where the number is
+// worth having.
+//
+// These drive processDMX() directly with fake clients that record what they
+// were handed, so they test the shipping send path rather than a description
+// of it.
+//
+// The fake client below defers its sequence increment instead of doing it
+// inline, because that is what the real one does: e131 increments inside the
+// dgram send CALLBACK, and Node runs no callback in the middle of a synchronous
+// for-loop. A fake that incremented inline would report a bug that cannot
+// happen and hide the one that can.
+function fakeSendRig(universeCount, routes) {
+    const sent = [];    // { host, u, seq }
+    const pending = []; // increments the real library would run in its callbacks
+    attitudeSACN.universes = universeCount;
+    attitudeSACN.routes = routes;
+    attitudeSACN.whiteBackupMode = false;
+    attitudeSACN.clientsByHost = new Map();
+    attitudeSACN.sequenceNumbers = new Array(universeCount).fill(0);
+    attitudeSACN.packets = [];
+    attitudeSACN.slotsDatas = [];
+
+    for (let u = 0; u < universeCount; u++) {
+        // a stand-in packet that holds a sequence byte, like the real one
+        let seq = 0;
+        attitudeSACN.packets[u] = {
+            _u: u,
+            getSequenceNumber() { return seq; },
+            setSequenceNumber(v) { seq = v; },
+            incrementSequenceNumber() { seq = (seq + 1) & 0xFF; },
+        };
+        attitudeSACN.slotsDatas[u] = new Array(512).fill(0);
+    }
+
+    for (const hostList of routes) {
+        for (const h of hostList) {
+            if (attitudeSACN.clientsByHost.has(h)) continue;
+            attitudeSACN.clientsByHost.set(h, {
+                send(packet, cb) {
+                    // record what actually went on the wire for this destination
+                    sent.push({ host: h, u: packet._u, seq: packet.getSequenceNumber() });
+                    // the real library bumps the sequence in its send callback,
+                    // which cannot run until this frame's loop has finished
+                    pending.push(() => packet.incrementSequenceNumber());
+                    if (cb) cb();
+                },
+            });
+        }
+    }
+    // one frame, then the callbacks the real library would have run
+    sent.frame = () => {
+        attitudeSACN.processDMX();
+        while (pending.length) pending.shift()();
+    };
+    return sent;
+}
+
+test('one destination: the sequence still advances by exactly one per frame', () => {
+    // The regression guard for the existing fleet. Every box in the field has
+    // one destination per universe, and this behaviour must not change at all.
+    const sent = fakeSendRig(1, [['239.255.0.1']]);
+    for (let f = 0; f < 5; f++) sent.frame();
+
+    const seqs = sent.map(s => s.seq);
+    assert.deepEqual(seqs, [0, 1, 2, 3, 4],
+        'a single-destination box must behave byte-for-byte as it always has');
+});
+
+test('two destinations get the SAME sequence number for the same frame', () => {
+    const sent = fakeSendRig(1, [['10.0.0.77', '239.255.0.1']]);
+    sent.frame();
+
+    assert.equal(sent.length, 2, 'both destinations should have been sent to');
+    assert.equal(sent[0].seq, sent[1].seq,
+        'the same frame delivered twice is one packet, and E1.31 sequence ' +
+        'numbers belong to the source and universe, not to a delivery');
+});
+
+test('the sequence advances by one per frame however many destinations there are', () => {
+    // Three destinations - John's overmapping case, where two Emit-8s and the
+    // multicast group all want the same universe.
+    const sent = fakeSendRig(1, [['10.0.0.77', '10.0.0.78', '239.255.0.1']]);
+    for (let f = 0; f < 4; f++) sent.frame();
+
+    const perHost = {};
+    for (const s of sent) (perHost[s.host] ||= []).push(s.seq);
+
+    for (const [host, seqs] of Object.entries(perHost)) {
+        assert.deepEqual(seqs, [0, 1, 2, 3],
+            `${host} saw ${JSON.stringify(seqs)} - an Emit-8 would report this ` +
+            `as two thirds of its packets missing`);
+    }
+});
+
+test('a receiver never sees a gap that its loss counter would call a lost packet', () => {
+    // Stated the way the device actually measures it: an Emit-8 counts
+    // (difference - 1) as missing whenever the difference exceeds 1.
+    const sent = fakeSendRig(2, [
+        ['10.0.0.77', '239.255.0.1'],           // Emit-8 + an Emit-1 on universe 1
+        ['10.0.0.77', '10.0.0.78', '239.255.0.2'],
+    ]);
+    for (let f = 0; f < 30; f++) sent.frame();
+
+    const streams = {};
+    for (const s of sent) (streams[`${s.host}/u${s.u}`] ||= []).push(s.seq);
+
+    let missing = 0;
+    for (const seqs of Object.values(streams)) {
+        for (let i = 1; i < seqs.length; i++) {
+            const d = ((seqs[i] - seqs[i - 1]) << 24) >> 24;   // signed 8-bit
+            if (d > 1) missing += d - 1;
+        }
+    }
+    assert.equal(missing, 0,
+        'a healthy link reported packet loss purely because of how many places ' +
+        'the frame was sent to');
+});
+
+test('the sequence wraps at 255 rather than running off the end of a byte', () => {
+    const sent = fakeSendRig(1, [['10.0.0.77', '239.255.0.1']]);
+    attitudeSACN.sequenceNumbers[0] = 254;
+    for (let f = 0; f < 3; f++) sent.frame();
+
+    const forHost = sent.filter(s => s.host === '10.0.0.77').map(s => s.seq);
+    assert.deepEqual(forHost, [254, 255, 0], 'sequence must wrap 255 -> 0');
+
+    // and the wrap must not read as a hole either
+    const d = ((0 - 255) << 24) >> 24;
+    assert.equal(d, 1, 'the wrap is a difference of +1 in signed 8-bit terms');
+});
+
+test('a universe routed nowhere is not sent and does not burn a sequence number', () => {
+    const sent = fakeSendRig(1, [[]]);
+    sent.frame();
+    assert.equal(sent.length, 0, 'nothing to send to');
+    assert.equal(attitudeSACN.sequenceNumbers[0], 0,
+        'an unsent frame must not advance the sequence, or the next real ' +
+        'receiver sees a hole that never happened');
 });

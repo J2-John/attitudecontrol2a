@@ -297,18 +297,19 @@ class ConfigManager {
 		return this.config.attitudeEmits ?? [];
 	}
 
-	// suppressSacnMulticast - may this location stop multicasting sACN?
+	// forceSacnMulticast - keep multicasting even where the routing says not to.
 	//
-	// Defaults to FALSE, and the default is the whole point. Third-party sACN
-	// receivers are in use at many locations and they appear nowhere in
-	// attitudeEmits, so "every Emit assigned here is an Emit-8" says nothing
-	// about who else is listening on 239.255.x.x. Suppressing multicast on that
-	// inference would take out equipment this box does not know exists.
+	// Defaults to FALSE, i.e. let the routing decide. A location that has an
+	// Emit-8 assigned does not have third-party sACN receivers on it - that is
+	// a deployment rule, not something the box inferred from its assignment
+	// list - so an all-Emit-8 location drops multicast on its own and this flag
+	// never has to be set.
 	//
-	// Set it per location only once someone has confirmed nothing else at that
-	// site consumes multicast sACN.
-	getSuppressSacnMulticast() {
-		return this.config.suppressSacnMulticast === true;
+	// It exists for the site that turns out to be an exception. Setting it pins
+	// that location back to today's behaviour without a firmware change, which
+	// is worth having when the alternative is a dark building.
+	getForceSacnMulticast() {
+		return this.config.forceSacnMulticast === true;
 	}
 	
 	// webOverrides

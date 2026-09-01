@@ -23,9 +23,21 @@ const LAPTOP_MODE = (process.platform == 'darwin');
 const BROADCAST_EMIT_ASSIGNMENTS_DELAY = 1000;
 
 // How long a discovered device's address stays usable after its last telemetry
-// packet. Devices announce once per second; a minute of silence means it is
-// gone, and its universes should fall back to multicast rather than being
-// unicast into a hole.
+// packet. A minute of silence means it is gone, and its universes should fall
+// back to multicast rather than being unicast into a hole.
+//
+// This number is a CONTRACT with the device firmware, not a local choice. A
+// device announcing less often than this gets pruned while it is still working,
+// and pruning one Emit-8 sets anyEmit8Undiscovered, which puts the WHOLE
+// LOCATION back on multicast - so one device's announce interval changes how
+// every other device at that site is fed. The Emit-8 announces every 10 s, six
+// chances inside this window, and carries a _Static_assert against this value
+// so its build fails if either number moves without the other.
+//
+// The interval the existing Emit-1 firmware uses is not recorded anywhere and
+// has not been measured here. An earlier version of this comment asserted once
+// per second; nothing in this repo establishes that. It does not affect this
+// code - the TTL is generous either way - but do not build on it.
 const EMIT_ADDRESS_TTL_MS = 60000;
 
 // Matches what an Emit-8 calls itself in telemetry. The server-side model
@@ -125,6 +137,14 @@ class AttitudeEmitManager {
 			// Remember where this device lives, so sACN can be unicast to it.
 			// _SOURCE_IP is attached by UDPManager from the datagram itself and
 			// is the one field here a device cannot lie about by claiming it.
+			//
+			// `universes` here is what the device REPORTS it is doing. Routing
+			// deliberately does not use it - computeRoutes reads the assigned
+			// universes from config instead, because the server's assignment is
+			// what is authoritative and a device echoing its own belief back
+			// would let a stale device pin its own routing. It is captured so
+			// that reported-versus-assigned can be compared, which is what
+			// `reported_universes` on the server is for.
 			if (typeof object._SOURCE_IP === 'string' && object._SOURCE_IP.length > 0) {
 				const universes = Array.isArray(object.UNIVERSES)
 					? object.UNIVERSES.filter(u => Number.isInteger(u) && u >= 1)
@@ -225,29 +245,38 @@ class AttitudeEmitManager {
 
 	// computeRoutes - decide, per universe, where this LOCATION's sACN goes.
 	//
-	//   Emit-8 assigned, nothing else   -> unicast, and multicast too UNLESS
-	//                                      this location has opted out
 	//   no Emit-8                       -> multicast, exactly as before
+	//   Emit-8 assigned, nothing else   -> unicast only
 	//   both an Emit-8 and an Emit-1    -> both
 	//
-	// Multicast is only ever dropped when configManager.getSuppressSacnMulticast()
-	// says this location has been checked. Third-party sACN receivers are in use
-	// at many sites and none of them appear in attitudeEmits, so the set of
-	// devices assigned here is NOT the set of devices listening. Inferring
-	// "nothing else needs multicast" from an assignment list would silently
-	// black out equipment this box has never heard of.
+	// The discriminator is "does this location HAVE an Emit-8", because a
+	// location with an Emit-8 assigned to it never has third-party sACN gear on
+	// it. That is a deployment rule (John, 2026-08-28), not something this code
+	// worked out from the assignment list - and the distinction matters. An
+	// earlier version tried to infer "nothing else needs multicast" from the
+	// list being all Emit-8s, which is invalid reasoning: third-party receivers
+	// are in use across the fleet and appear nowhere in attitudeEmits, so that
+	// inference would have blacked out equipment the box has never heard of.
+	// The rule is sound where the inference was not, so the flag that used to
+	// gate this is gone.
 	//
 	// The decision is per location because each control box only ever sees and
-	// feeds its own site. Suppressing multicast where nothing needs it keeps a
+	// feeds its own site. Dropping multicast where nothing needs it keeps a
 	// site's cheap unmanaged switches from flooding eight universes to every
 	// port, which is the practical reason to bother.
 	//
-	// Two deliberate safety valves:
+	// Three deliberate safety valves, all of which prevent the only bad outcome
+	// here - a receiver that needed multicast and stopped getting it:
+	//   - a non-Emit-8 anywhere in this location's list keeps multicast. An
+	//     Emit-1 receives by multicast and nothing else feeds it.
 	//   - an Emit-8 that is assigned but has not yet been heard from has no
-	//     address to unicast to, so that universe KEEPS multicast until it
-	//     announces itself. Boot order must not black out a site.
-	//   - any universe that ends up with no destination at all falls back to
-	//     multicast inside AttitudeSACN.setRoutes().
+	//     address to unicast to, so multicast STAYS until it announces itself.
+	//     Boot order must not black out a site.
+	//   - configManager.getForceSacnMulticast() pins a location back to
+	//     multicast unconditionally, for the site that turns out to be an
+	//     exception to the deployment rule. Off by default.
+	//   - and any universe that still ends up with no destination at all falls
+	//     back to multicast inside AttitudeSACN.setRoutes().
 	computeRoutes(universeCount) {
 		const emitList = configManager.getAttitudeEmits();
 		const now = Date.now();
@@ -286,11 +315,12 @@ class AttitudeEmitManager {
 			}
 		}
 
-		// Multicast stays on unless ALL of these hold: the location has opted
-		// out, every Emit here is an Emit-8, and every one of them is actually
-		// reachable by unicast. Any doubt at all keeps multicast.
-		const optedOut = configManager.getSuppressSacnMulticast();
-		const keepMulticast = !optedOut || !anyEmit8 || anyNonEmit8 || anyEmit8Undiscovered;
+		// Multicast drops only when ALL of these hold: this location has an
+		// Emit-8, every Emit here is an Emit-8, every one of them is actually
+		// reachable by unicast, and the location has not been pinned to
+		// multicast. Any doubt at all keeps multicast.
+		const forced = configManager.getForceSacnMulticast();
+		const keepMulticast = forced || !anyEmit8 || anyNonEmit8 || anyEmit8Undiscovered;
 
 		const routes = [];
 		for (let u = 1; u <= universeCount; u++) {
@@ -301,7 +331,7 @@ class AttitudeEmitManager {
 			routes[u - 1] = hosts;
 		}
 
-		return { routes, keepMulticast, optedOut, anyEmit8, anyNonEmit8, anyEmit8Undiscovered };
+		return { routes, keepMulticast, forced, anyEmit8, anyNonEmit8, anyEmit8Undiscovered };
 	}
 
 
