@@ -79,8 +79,16 @@ class AttitudeSACN {
 		// variable to track white backup mode
 		this.whiteBackupMode = false;
 
-		// set an interval for FPS once per second
-		setInterval(() => {
+		// Set an interval for FPS once per second.
+		//
+		// unref'd for the same reason as Logger's cleanup timer: a reporting
+		// timer must not be the thing keeping the process alive. In the app the
+		// sACN sockets and the DMX interval hold it open regardless. In the test
+		// runner this one plus Logger's were the only handles left, which forced
+		// --test-force-exit, which process.exit()s before the TAP stream drains
+		// and silently dropped a suffix of the test file - runs reporting 64,
+		// then 61, then 55 tests, all exiting 0 with `# fail 0`.
+		const fpsTimer = setInterval(() => {
 			if (DEBUG_FPS) {
 				// if debugging FPS, actually log the FPS to console
 				logger.info(`DMX over sACN status fps: ${this.fps}`);
@@ -98,6 +106,7 @@ class AttitudeSACN {
 			// reset fps counter
 			this.fps = 0;
 		}, 1000);
+		if (typeof fpsTimer?.unref === 'function') fpsTimer.unref();
 	}
 
 

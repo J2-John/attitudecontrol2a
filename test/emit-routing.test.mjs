@@ -22,9 +22,14 @@ function setConfig(emits, forceMulticast = false) {
     configManager.getForceSacnMulticast = () => forceMulticast;
 }
 
+// A device with an assigned ID and no chip id - i.e. the shipping Emit-1
+// firmware, and what every one of these routing cases is about. The chip-id
+// path is exercised in emit-enrollment.test.mjs.
 function discover(id, ip, name, universes) {
-    emitManager.discovered.set(id, {
-        ip, name, universes,
+    emitManager.discovered.set(`id:${id}`, {
+        ip, deviceId: '', id, name,
+        ports: universes.length || 1,
+        universes,
         isEmit8: /emit[\s._-]*8/i.test(name),
         lastSeen: Date.now(),
     });
@@ -131,8 +136,9 @@ test('an assigned Emit-8 that has not announced itself keeps multicast', () => {
 test('a stale address is dropped and the universe falls back to multicast', () => {
     reset();
     setConfig([{ id: 7, assigned_universes: [1], model: 'Emit-8' }]);
-    emitManager.discovered.set(7, {
-        ip: '10.0.0.77', name: 'Emit-8', universes: [1], isEmit8: true,
+    emitManager.discovered.set('id:7', {
+        ip: '10.0.0.77', deviceId: '', id: 7, name: 'Emit-8', ports: 1,
+        universes: [1], isEmit8: true,
         lastSeen: Date.now() - 120000,      // two minutes ago
     });
 
