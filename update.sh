@@ -37,6 +37,23 @@ PM2_APP_NAME="AttitudeControl2A"
 # install from a fork - useful for canary testing a branch before it reaches main:
 #   ATT_REPO_URL=https://github.com/J2-John/attitudecontrol2a ./update.sh my-branch
 REPO_URL="${ATT_REPO_URL:-https://github.com/DrewJSquared/attitudecontrol2a}"
+# What this updater can do, as a number the APP can read off disk.
+#
+# The old 26-line updater announced itself only inside an echo at the very end -
+# `echo "Attitude update.sh script v071724 complete!"` - which is useless to
+# anything that has to DECIDE whether the updater on disk can be trusted, and
+# which it printed whether or not any of the preceding four commands worked.
+#
+# 1  the pre-2026-08-08 script. No set -e, no -f on curl, no return value checked
+#    anywhere, exits 0 unconditionally. It has no marker: absence means 1.
+# 2  this one. Validates before touching anything live, snapshots, health checks
+#    for positive proof the render loop runs, rolls itself back, and records the
+#    outcome in attitude-build.json.
+#
+# MacrosModule.bootstrapLegacyUpdater() reads this line. Raise it when the
+# contract changes, never when the script merely changes.
+ATT_UPDATER_API=2
+
 BRANCH="${1:-main}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

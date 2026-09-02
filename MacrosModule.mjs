@@ -11,6 +11,8 @@
 // import modules
 import { exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import eventHub from './EventHub.mjs';
 
 import Logger from './Logger.mjs';
@@ -24,6 +26,43 @@ import configManager from './ConfigManager.mjs';
 const SAMPLE_INTERVAL = 15000;  // interval for how often to process macros (should be 15000ms)
 const LAPTOP_MODE = (process.platform == 'darwin');
 const MACROS_PROCESSING_TIMEOUT = 60000;  // should be 60000ms
+
+// ---------------------------------------------------------------- the legacy-updater bootstrap
+//
+// Roughly 500 SD cards were provisioned with the pre-2026-08-08 updater, and
+// they cannot be re-imaged. That script is 26 lines with no `set -e`, no `-f`
+// on curl, and not one return value checked; it ends with an unconditional
+// `echo "...complete!"`, so a failed download, a failed unzip and a failed
+// rsync all report success. A box can sit for weeks taking no updates while
+// every one of them looks like it worked. Box 151 did exactly that.
+//
+// The way out does not need the cards to change, because the old updater's
+// rsync copies the WHOLE repo tree - update.sh included. So:
+//
+//   cycle 1  the old script runs on a flag and replaces itself with this one,
+//            along with the rest of the app. It cannot verify any of that, and
+//            does not need to.
+//   cycle 2  the new code - this file - comes up, notices the real updater has
+//            never run here, and runs it once. On a box cycle 1 brought current
+//            that lands on update.sh's `already-current` path, which exits
+//            BEFORE the snapshot, the rsync and any restart: it downloads,
+//            compares versions, writes attitude-build.json and quits. On a box
+//            where cycle 1 only half-worked it performs a real, validated,
+//            health-checked, roll-back-able update instead.
+//
+// Either way a device that asks for one update ends up on current code with a
+// build record that says so, and every device that ever asks again is running
+// an updater that cannot lie about the answer.
+//
+// This is deliberately NOT tied to the update flag. A box whose flag is set
+// once and whose cycle 1 succeeded would otherwise need a second flag to get a
+// verified record, and nobody would know which boxes those were.
+const LEGACY_BOOTSTRAP_DELAY = 90000;   // let the app settle and the network come up first
+const LEGACY_BOOTSTRAP_MIN_API = 2;     // see ATT_UPDATER_API in update.sh
+const LEGACY_BOOTSTRAP_MAX_ATTEMPTS = 3;
+const LEGACY_BOOTSTRAP_RETRY_MS = 6 * 60 * 60 * 1000;
+const BUILD_STATE_FILE = 'attitude-build.json';
+const BOOTSTRAP_STATE_FILE = '.attitude-bootstrap.json';
 
 
 
@@ -63,6 +102,165 @@ class MacrosModule {
             // process macros
             this.processMacros();
         }, this.sampleInterval);
+
+        // One shot, delayed. See the long note above LEGACY_BOOTSTRAP_DELAY.
+        // unref'd so it can never be the reason this process stays alive.
+        const t = setTimeout(() => this.bootstrapLegacyUpdater(), LEGACY_BOOTSTRAP_DELAY);
+        if (typeof t?.unref === 'function') t.unref();
+    }
+
+
+    // Read ATT_UPDATER_API out of the updater on disk. 1 means the old script,
+    // which does not carry the marker at all - absence is the answer, not an
+    // error. null means there is no updater here to reason about.
+    readUpdaterApi(updaterPath) {
+        let text;
+        try {
+            text = fs.readFileSync(updaterPath, 'utf8');
+        } catch (error) {
+            return null;
+        }
+        // Anchored to the start of a line so the marker cannot be matched inside
+        // a comment that merely mentions it - including the one in this file, if
+        // these two ever end up concatenated by a packaging step.
+        const m = text.match(/^ATT_UPDATER_API=(\d+)/m);
+        return m ? Number(m[1]) : 1;
+    }
+
+
+    readBootstrapState(file) {
+        try {
+            return JSON.parse(fs.readFileSync(file, 'utf8'));
+        } catch (error) {
+            return { attempts: 0, lastAttempt: 0 };
+        }
+    }
+
+
+    // Should cycle 2 run here, and why?
+    //
+    // Split out from the launching so the DECISION can be tested on any
+    // platform. The launch cannot: it spawns a bash script that only exists on
+    // a device. Left inside one method, the whole thing was untestable
+    // anywhere but Linux - and worse, on Windows every "it must not launch"
+    // assertion passed because nothing there can launch, which is a vacuous
+    // pass rather than a skip.
+    //
+    // Returns { go, reason, warn }. `reason` is the sentence a person needs
+    // when they are looking at a box that is not doing what they expected.
+    bootstrapDecision() {
+        const home = os.homedir();
+        const updater = path.join(process.cwd(), 'update.sh');
+
+        // 1. The real updater has already run here and recorded what it did.
+        //    Nothing to bootstrap, now or ever - whatever the outcome was.
+        //    Re-running it because we did not like the answer is a rollback loop.
+        if (fs.existsSync(path.join(home, BUILD_STATE_FILE))) {
+            return { go: false, reason: 'the validating updater has already run here' };
+        }
+
+        // 2. Is the updater on disk one we can trust to be honest? On a box
+        //    where cycle 1 has not happened yet this is still the old script,
+        //    and launching THAT would just produce another cheerful lie - and,
+        //    worse, a restart 30 seconds later for nothing.
+        const api = this.readUpdaterApi(updater);
+        if (api === null) {
+            return { go: false, warn: true,
+                reason: 'No update.sh found - this device cannot update itself.' };
+        }
+        if (api < LEGACY_BOOTSTRAP_MIN_API) {
+            return { go: false, warn: true,
+                reason: `This device still has the legacy updater (API ${api}). It will be `
+                    + `replaced the first time an update is flagged from the server; nothing `
+                    + `can be verified here until then.` };
+        }
+
+        // 3. Attempt cap. If update.sh dies without writing a build state -
+        //    killed, out of disk, no network - check 1 stays false forever, and
+        //    without this we would relaunch it on every boot.
+        const state = this.readBootstrapState(path.join(home, BOOTSTRAP_STATE_FILE));
+        const attempts = Number(state.attempts) || 0;
+        const since = Date.now() - (Number(state.lastAttempt) || 0);
+        if (attempts >= LEGACY_BOOTSTRAP_MAX_ATTEMPTS) {
+            return { go: false,
+                reason: `gave up after ${attempts} attempts to run the validating updater` };
+        }
+        if (attempts > 0 && since < LEGACY_BOOTSTRAP_RETRY_MS) {
+            return { go: false, reason: 'a recent attempt has not aged out yet' };
+        }
+
+        return { go: true, api, attempts,
+            reason: `never run the validating updater (API ${api})` };
+    }
+
+
+    // Cycle 2. Runs at most once on a device that has never run the real
+    // updater, and never again after that updater has written a build state.
+    bootstrapLegacyUpdater() {
+        try {
+            const home = os.homedir();
+            const bootstrapState = path.join(home, BOOTSTRAP_STATE_FILE);
+            const updater = path.join(process.cwd(), 'update.sh');
+
+            const decision = this.bootstrapDecision();
+            if (!decision.go) {
+                if (decision.warn) logger.warn(decision.reason);
+                return;
+            }
+            const { api, attempts } = decision;
+
+            // Written BEFORE the spawn, not after. The updater restarts this
+            // process, so anything recorded afterwards may never be recorded.
+            try {
+                fs.writeFileSync(bootstrapState, JSON.stringify({
+                    attempts: attempts + 1,
+                    lastAttempt: Date.now(),
+                    note: 'first run of the real updater on a device provisioned with the legacy one',
+                }));
+            } catch (error) {
+                // If we cannot record the attempt we must not make it, or a
+                // read-only home directory becomes a reboot loop.
+                logger.error(`Could not record the bootstrap attempt: ${error}. Not launching.`);
+                return;
+            }
+
+            // rsync from a zip should preserve the executable bit, but a device
+            // that cannot run its own updater is not a failure worth inheriting
+            // from an archive's metadata.
+            try { fs.chmodSync(updater, 0o755); } catch (error) { /* not fatal */ }
+
+            logger.info(`This device has never run the validating updater (API ${api}). `
+                + `Running it once to establish a verified build record. `
+                + `Attempt ${attempts + 1} of ${LEGACY_BOOTSTRAP_MAX_ATTEMPTS}.`);
+
+            // Detached, for exactly the reason handleUpdate() is - see the note
+            // there. An updater that is a child of the process it restarts gets
+            // killed by that restart.
+            const child = spawn('./update.sh', [], {
+                detached: true,
+                stdio: 'ignore',
+                cwd: process.cwd(),
+            });
+
+            // spawn reports a failure to LAUNCH - not executable, not found -
+            // as an asynchronous 'error' event, and a ChildProcess with no
+            // listener for it throws that error globally. The try/catch around
+            // this block cannot catch it, because by then we have returned. On
+            // a device whose update.sh lost its executable bit that would take
+            // the whole app down, which is a much worse outcome than not
+            // updating.
+            child.on('error', (err) => {
+                logger.error(`Could not launch the updater: ${err}. This device will `
+                    + `not have a verified build record until an update is flagged.`);
+            });
+
+            // let it go - without this, node keeps a handle to it and waits
+            child.unref();
+        } catch (error) {
+            // Best effort by definition. A device that fails to bootstrap must
+            // still run lights.
+            logger.error(`Legacy updater bootstrap failed: ${error}`);
+        }
     }
 
 
