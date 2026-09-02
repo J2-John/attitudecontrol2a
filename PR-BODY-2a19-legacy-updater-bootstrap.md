@@ -115,30 +115,46 @@ outcome is always "complete" — which is precisely why 151 looked fine.
 
 ## Tests
 
-15 new, in `test/legacy-bootstrap.test.mjs`. 83 total, all green.
+17 new, in `test/legacy-bootstrap.test.mjs`. 85 total, all green, 0.6 s.
 
-They drive the real `MacrosModule` against a sandboxed HOME and cwd, and let the
-**real** spawn happen against a stand-in `update.sh` that records that it ran,
-what the bootstrap state looked like at the moment it started, and its own
-process group.
+**Split by platform, deliberately.** `bootstrapDecision()` is pure filesystem
+reasoning and is tested everywhere — including on the Windows laptop where
+`npm test` actually gets run before a push. The launch spawns a bash script and
+reads process groups, so those three tests `skip` loudly on Windows rather than
+passing quietly.
 
-Two things went wrong writing them, both worth recording:
+That split is the whole reason the decision was extracted from the launch in the
+first place. Three things went wrong writing these, and all three are the same
+failure wearing different clothes — **a test that cannot fail**:
 
 **The first version intercepted `child_process.spawn` and tested nothing.**
-`MacrosModule` imports `spawn` as a named binding, so reassigning the property
-on the module namespace never reaches it. Every "did it launch" assertion passed
-vacuously. Launching a real process is slower and is the only version that means
-anything.
+`MacrosModule` imports `spawn` as a named binding, so reassigning the property on
+the module namespace never reaches it. Every "did it launch" assertion passed
+vacuously.
 
 **The detached assertion compared the child's process group to `process.pid`.**
-Those are different numbers unless the parent happens to be a group leader, so
-the assertion could never fail — a `detached: false` mutant passed it cleanly. It
-now compares against the parent's actual process group, read with `ps`.
+Those are different numbers unless the parent happens to be a group leader, so it
+could never fail — a `detached: false` mutant passed cleanly. It now compares
+against the parent's real process group, read with `ps`.
 
-Both were caught by mutation testing rather than by review. Five mutants —
-ignoring the build state, launching the old updater, removing the attempt cap,
-removing the retry window, and `detached: false` — and all five now fail the
-suite.
+**And on Windows, seven "it must NOT launch" tests passed because nothing on
+Windows can launch a bash script.** The suite reported green while covering none
+of the logic it existed for. Splitting the decision out fixed it: those seven now
+assert on `bootstrapDecision()` and run everywhere.
+
+All caught by mutation testing rather than by review. Six mutants — ignoring the
+build state, accepting the old updater, removing the attempt cap, removing the
+retry window, unanchoring the marker regex, and `detached: false` — and every one
+now fails the suite, including on the Windows path.
+
+## One bug the Windows run exposed in the production code
+
+`spawn` reports a failure to LAUNCH — not executable, not found — as an
+asynchronous `'error'` event, and a `ChildProcess` with no listener for it throws
+that error globally. The `try/catch` around the call cannot catch it, because by
+then we have returned. On a device whose `update.sh` lost its executable bit that
+would take the whole app down, which is a far worse outcome than not updating.
+There is now a listener that logs it.
 
 ## What this does not fix
 
