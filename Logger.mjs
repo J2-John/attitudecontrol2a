@@ -38,11 +38,24 @@ class Logger {
     	// store recent log entries and their counts in a map
     	this.logHistory = new Map();
 
-		// timer to clean up old log entries
-		setInterval(() => {
+		// Timer to clean up old log entries.
+		//
+		// unref'd: this timer must not be the reason the process stays alive. In
+		// the app it never is - the UDP sockets, the DMX engine and the network
+		// queue all hold handles, and a process whose only remaining handle is a
+		// log-cleanup timer has nothing left to log about. In the test runner it
+		// was: every `new Logger()` at import time held the child open, which is
+		// why the suite needed --test-force-exit, and --test-force-exit calls
+		// process.exit() before the TAP stream has drained. The visible symptom
+		// was a run reporting 64 tests, then 61, then 55, always dropping a
+		// SUFFIX of the file, always exiting 0 with `# fail 0`. Tests that never
+		// ran cannot fail, so the newest tests in a file were the least likely
+		// to be enforced - the exact opposite of what a suite is for.
+		this.cleanupTimer = setInterval(() => {
             // clean up old logs function
             this.cleanupOldLogs();
         }, CLEANUP_INTERVAL);
+		if (typeof this.cleanupTimer?.unref === 'function') this.cleanupTimer.unref();
 	}
 
 
