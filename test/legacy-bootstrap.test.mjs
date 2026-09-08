@@ -35,6 +35,11 @@ const { default: macros } = await import('../MacrosModule.mjs');
 const POSIX = process.platform !== 'win32';
 const NEEDS_POSIX = POSIX ? false : 'needs a POSIX host: spawns a bash script and reads process groups';
 
+// A different reason, so the skip line says the true one. Windows has no execute bit: chmod(0o644)
+// only toggles read-only and access(X_OK) succeeds for any existing file, so "present but not
+// executable" is a state the test cannot construct there.
+const NEEDS_EXEC_BIT = POSIX ? false : 'needs a POSIX host: depends on an execute bit Windows does not have';
+
 const OLD_UPDATER = '#!/bin/bash\ncurl -L -o f.zip url\nunzip f.zip\necho "Attitude update.sh script v071724 complete!"\n';
 
 let sandbox, home, appDir, realHomedir, realCwd;
@@ -192,6 +197,48 @@ test('the attempt is recorded, and only when it is going to launch', () => {
         macros.bootstrapLegacyUpdater();
         assert.equal(fs.existsSync(statePath()), false,
             'a device that is not bootstrapping must not burn an attempt');
+    } finally { teardown(); }
+
+    // AN UNLAUNCHABLE UPDATER MUST COST ZERO ATTEMPTS.
+    //
+    // The record has to be written before the spawn - the updater restarts us - which means an
+    // updater that cannot launch at all still consumed one of three attempts. Across two retry
+    // windows that is a device permanently reporting "gave up", with no verified build record
+    // ever, for a reason no attempt could have fixed. A worn card that remounts read-only is the
+    // realistic route, and card wear is this fleet's established failure mode.
+    setup({ updater: null });          // no update.sh at all
+    try {
+        macros.bootstrapLegacyUpdater();
+        assert.equal(fs.existsSync(statePath()), false,
+            'a missing updater must not burn an attempt');
+    } finally { teardown(); }
+
+});
+
+
+// Split out of the test above rather than folded into it, so that on Windows this reports as a
+// SKIP with a reason instead of quietly not running. The three assertions above it are genuinely
+// cross-platform and still run everywhere; this one is not, for a reason worth stating.
+//
+// The premise is "update.sh exists but is not executable, and chmod cannot repair it". On Windows
+// that state cannot be constructed: there is no execute bit, chmodSync(0o644) only toggles the
+// read-only flag, and accessSync(X_OK) succeeds for any file that exists. So the code under test
+// correctly sees an executable updater, launches it, records the attempt - and the assertion
+// fails while the code is behaving exactly as intended on the platform it ships to.
+test('an updater that cannot be made executable must not burn an attempt', { skip: NEEDS_EXEC_BIT }, () => {
+    const statePath = () => path.join(home, '.attitude-bootstrap.json');
+
+    setup({});
+    try {
+        fs.chmodSync(path.join(appDir, 'update.sh'), 0o644);
+        const realChmod = fs.chmodSync;
+        fs.chmodSync = () => { throw new Error('EROFS: read-only file system'); };
+        try {
+            macros.bootstrapLegacyUpdater();
+        } finally { fs.chmodSync = realChmod; }
+
+        assert.equal(fs.existsSync(statePath()), false,
+            'an updater that cannot be made executable must not burn an attempt either');
     } finally { teardown(); }
 });
 

@@ -17,6 +17,7 @@ import configManager from './ConfigManager.mjs';
 import attitudeScheduler from './AttitudeScheduler.mjs';
 import attitudeSACN from './AttitudeSACN2A.mjs';
 import showTableStore, { isDeviceRenderable } from './ShowTableStore.mjs';
+import renderWatchdog from './RenderWatchdog.mjs';
 
 // import engine
 import { AttitudeEngine3 } from './AttitudeEngine3.mjs';
@@ -98,6 +99,11 @@ class AttitudeFixtureManager {
     // processFixtures - master function that runs every 25ms to process fixtures/shows/schedule,
     // run engine, then send values to sACN/DMX
     processFixtures() {
+    	// Open a watchdog frame. Everything below either covers the segments it owes or does not,
+    	// and endFrame() at the bottom decides whether this counted as a live frame. See
+    	// RenderWatchdog.mjs for why segment coverage - and not the pixel values - is the signal.
+    	renderWatchdog.beginFrame();
+
     	// try to process fixtures
     	try {
     		// check if we are assigned to a location or not
@@ -185,11 +191,26 @@ class AttitudeFixtureManager {
 		        });
 		    } else {
 		    	// otherwise we aren't assigned to a location, so set everything to white
-		    	for (let u = 1; u <= 8; u++) {
+		    	//
+		    	// This was a hardcoded 8 while AttitudeControl2A initialises SIXTEEN universes,
+		    	// so a device that went from assigned to unassigned left universes 9-16 frozen
+		    	// on their last rendered frame while the log line below claimed white had been
+		    	// output to all channels. Use the real count rather than a second literal - the
+		    	// constructor default is 4 and tests mutate it, so another hardcoded number
+		    	// would drift out of sync exactly as this one did.
+		    	//
+		    	// Kept as a per-frame re-assert deliberately. It looks redundant because
+		    	// initialize() pre-fills every slot with 255 at boot - but that only covers a
+		    	// device unassigned since boot. On an assigned -> unassigned transition the
+		    	// slots hold show colours, and this loop is the only thing that clears them.
+		    	for (let u = 1; u <= attitudeSACN.universes; u++) {
 		    		for (let c = 1; c <= 512; c++) {
 		    			attitudeSACN.set(u, c, 255);
 		    		}
 		    	}
+
+		    	// A complete, correct frame with no patch to account for.
+		    	renderWatchdog.coverWholeFrame();
 
 	    		// log the interval
 	    		if (configManager.checkLogLevel('detail')) {
@@ -204,6 +225,11 @@ class AttitudeFixtureManager {
 		        });
 		    }
     	} catch (error) {
+    		// The whole frame died. Recorded so endFrame does not mistake "nothing was patched"
+    		// for "nothing went wrong" - an outer throw can happen before a single segment is
+    		// registered.
+    		renderWatchdog.noteZoneFault();
+
     		// else log error
             logger.error(`Error processing fixtures: ${error}`);
 
@@ -213,6 +239,18 @@ class AttitudeFixtureManager {
 	            status: 'errored',
 	            data: `Error processing fixtures: ${error}`,
 	        });
+        } finally {
+        	// FINALLY, not at the end of the assigned branch.
+        	//
+        	// An earlier version closed the frame next to PERF.frames++, which sits inside the
+        	// assigned branch - so an UNASSIGNED device never closed a frame at all and read as
+        	// frozen within five seconds, every one of them, fleet-wide. Caught by the
+        	// integration test rather than by inspection, which is the argument for having one.
+        	//
+        	// Here it also runs on the outer catch path, where it correctly records a frame that
+        	// covered nothing. PERF.frames counts loop ITERATIONS and stays healthy at 40fps
+        	// through every frozen-output route; this counts frames that actually rendered.
+        	renderWatchdog.endFrame();
         }
     }
 
@@ -279,6 +317,12 @@ class AttitudeFixtureManager {
 								// apply this show ID to these fixtures
 								this.applyShowToFixtures(currentGroupShowId, fixturesForThisShow);
 							} catch (error) {
+								// This group wrote nothing. Recorded so the watchdog can tell a
+								// device with nothing patched from one whose zones are all
+								// bailing out - both otherwise reach endFrame with zero
+								// expected segments.
+								renderWatchdog.noteZoneFault();
+
 								// log the error while processing this group
 								logger.error(`Error while processing zone ${index+1} group ${groupIndex+1}: ${error.message}`);
 
@@ -303,6 +347,9 @@ class AttitudeFixtureManager {
 					this.applyShowToFixtures(currentZoneSchedule, fixturesForThisShow);
 				}
 			} catch (error) {
+				// This zone wrote nothing - see the note in the group catch above.
+				renderWatchdog.noteZoneFault();
+
 				let zoneName = zone.name;
 				if (zoneName == undefined) {
 					zoneName = index;
@@ -341,7 +388,17 @@ class AttitudeFixtureManager {
 		// calculate all fixture segments (handling single, multicount, and segmented fixtures).
 	    // Computed before anything else now, because the segment count is what identifies a
 	    // show table and therefore what decides whether a server-only show can play at all.
+	    // A LOWER BOUND, registered before calculateAllFixtureSegments - which can itself throw,
+	    // on a fixture whose type id does not resolve. An earlier version registered only after
+	    // it returned, so a zone that died there was invisible: its fixtures held their last DMX
+	    // values forever while the watchdog reported the device as rendering. One segment per
+	    // fixture is the floor; the exact count is added below.
+	    renderWatchdog.expectSegments(fixtures.length);
+
 	    let fixtureSegments = this.calculateAllFixtureSegments(fixtures);
+
+	    // The real count, now that it is known. Only the excess over the floor already booked.
+	    renderWatchdog.expectSegments(fixtureSegments.length - fixtures.length);
 
 	    // SHOW GENERATIONS.
 	    // A show this device's engine cannot render is SERVER-ONLY: we play its table, or we
@@ -375,6 +432,9 @@ class AttitudeFixtureManager {
 	    			attitudeSACN.set(seg.universe, seg.startAddress + 2, 255);
 	    			if (seg.colorMode == 'RGBW') attitudeSACN.set(seg.universe, seg.startAddress + 3, 255);
 	    		}
+
+	    		// White on every segment is a deliberate, complete frame, not a frozen one.
+	    		renderWatchdog.coverSegments(fixtureSegments.length);
 	    		return;
 	    	}
 
@@ -466,6 +526,20 @@ class AttitudeFixtureManager {
 					attitudeSACN.set(fixtureSegment.universe, fixtureSegment.startAddress+3, thisFixtureColor.white);
 				} else {
 					throw new Error(`Unknown fixture color mode ${fixtureSegment.colorMode}`);
+				}
+
+				// This segment reached a DMX write. Counted here rather than before the loop so a
+				// throw part-way through leaves the remainder uncovered - which is precisely the
+				// zone-throws route, where the surviving segments keep their last values and the
+				// rest of the patch is silently abandoned mid-frame.
+				//
+				// NOT counted when this show's engine reported a fault: the write happened, but
+				// the pixels it wrote are last frame's. That is the swallowed-engine-fault route,
+				// and scoping it to the affected show is what stops one broken engine - including
+				// the fallback show's, which is force-created even when nothing schedules it -
+				// reporting a fully-rendering device as frozen.
+				if (!renderWatchdog.engineFaulted(showId)) {
+					renderWatchdog.coverSegments(1);
 				}
 			});
 		} catch (error) {
@@ -684,7 +758,16 @@ class AttitudeFixtureManager {
 		    if (showTableStore.isFullyCovered(engineInstance.showId)) {
 		    	engineInstance.engine.incrementFrameCounter();
 		    } else {
-		    	engineInstance.engine.run();
+		    	// THE RETURN VALUE IS THE POINT, and it used to be discarded.
+		    	//
+		    	// run() returns undefined from every success path and returns its fallback colour
+		    	// object from its catch, so this is the only way the caller can tell a rendered
+		    	// frame from a swallowed engine fault. The engine's frame counter cannot do it -
+		    	// incrementFrameCounter() is called before the try, so it advances either way.
+		    	//
+		    	// Nothing is done with the colour itself, deliberately. Applying it would turn a
+		    	// frozen zone black, and a dark car wash is worse than a stale one.
+		    	renderWatchdog.noteEngineRun(engineInstance.engine.run(), engineInstance.showId);
 		    }
 		});
 	}

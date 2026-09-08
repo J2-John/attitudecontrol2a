@@ -1,0 +1,78 @@
+# Runs the checks that already existed in bench/ but that nothing ever ran automatically.
+#
+# Before this, `npm test` covered the emit subsystem only - 68 tests, none of them touching the
+# engine, the fixture manager, the scheduler or the config manager. bench/ held real regression
+# tests (golden fingerprints across 560 configurations, and the two hang defects) and they were
+# not in test/, not in package.json, and not in update.sh. A green test run meant "the emit
+# manager is fine" and asserted nothing about whether a device could render a frame.
+#
+# NOT covered here: the three-copy engine drift check. It needs the gateway and Laravel repos
+# checked out beside this one, and one of those is private, so it runs in the local pre-flight
+# instead - `npm run drift`. Wiring it up here needs a deploy key for those repos; worth doing,
+# because the browser copy is the one that has silently fallen behind four times.
+name: preflight
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Devices run Node 16. Test on it so a syntax or API assumption that only holds on a
+      # newer runtime cannot pass here and then fail on the hardware.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+
+      - name: Module load and cross-file contracts
+        run: node bench/module-smoke.mjs
+
+      - name: Engine golden fingerprints (560 configurations)
+        run: node bench/golden.mjs verify bench/golden.json
+
+      - name: Known defects stay fixed
+        run: node bench/defects.mjs
+
+      # `node --test test/` and not a quoted glob: node only expands globs itself from v21,
+      # and this job deliberately runs the version the devices run.
+      - name: Unit tests
+        run: npm test
+
+      # VERSION must move with any change that REACHES A DEVICE. Two builds sharing a version
+      # makes the fleet census meaningless, which is a release rule in the operations handbook.
+      #
+      # Scoped to files that actually ship. A docs, CI or bench-only PR changes nothing on the
+      # hardware, and failing those would train people to ignore this check - which is worse
+      # than not having it.
+      - name: VERSION was bumped
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          BASE=origin/${{ github.base_ref }}
+
+          SHIPPED=$(git diff --name-only $BASE -- '*.mjs' '*.js' 'update.sh' 'package.json' \
+                    ':(exclude)bench/*' ':(exclude)test/*')
+
+          if [ -z "$SHIPPED" ]; then
+            echo "No device-facing files changed; VERSION bump not required."
+            exit 0
+          fi
+
+          echo "Device-facing files changed:"
+          echo "$SHIPPED" | sed 's/^/  /'
+
+          if git diff --quiet $BASE -- VERSION; then
+            echo ""
+            echo "VERSION is unchanged on this branch."
+            echo "Bump it in the same commit as the code change - two builds sharing a version"
+            echo "makes the fleet version census meaningless."
+            exit 1
+          fi
+
+          echo ""
+          echo "VERSION: $(cat VERSION)"

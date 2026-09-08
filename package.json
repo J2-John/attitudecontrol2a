@@ -1,7 +1,12 @@
 {
   "type": "module",
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test test/*.test.mjs",
+    "golden": "node bench/golden.mjs verify bench/golden.json",
+    "defects": "node bench/defects.mjs",
+    "smoke": "node bench/module-smoke.mjs",
+    "drift": "node bench/engine-drift.mjs",
+    "preflight": "npm run smoke && npm run golden && npm run defects && npm test"
   },
   "dependencies": {
     "e131": "^1.1.3",

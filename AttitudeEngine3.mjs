@@ -19,6 +19,72 @@ const MAX_COLOR_VALUE = 255; // max value for colors
 const SPEED_MIN_BPM = 10;
 const SPEED_MAX_BPM = 180;
 
+// Minimum gap between identical error reports out of the render path, in milliseconds.
+const ERROR_REPORT_THROTTLE_MS = 60000;
+
+// How many distinct error messages to keep throttle state for, evicted least-recently-reported.
+const MAX_TRACKED_ERRORS = 64;
+
+const lastReportedAt = new Map();
+
+// Throttled error reporting for the render path.
+//
+// THIS FILE IS VENDORED VERBATIM into attitude-ws-gateway/engine/ and
+// attitudelighting/public/js/engine/. It imports ShowTypes, Directions and Transitions and
+// NOTHING ELSE, and that is a constraint rather than an oversight: Logger.mjs does not exist
+// in either of those trees and its EventHub dependency would not resolve there. Routing this
+// through Logger like every sibling module does would break the gateway's table rendering and
+// the show editor's browser preview, and would make bench/table-equivalence.mjs unrunnable.
+//
+// So: no imports, no Node built-ins, nothing beyond console. Just a rate limit.
+function reportEngineError(context, error) {
+    try {
+        const key = context + '|' + (error && error.message ? error.message : String(error));
+        const now = Date.now();
+        const previous = lastReportedAt.get(key);
+
+        // `now >= previous` matters: Date.now() is not monotonic and field devices NTP-correct.
+        // A backward jump would otherwise make (now - previous) negative, which is < the
+        // threshold, and silence this reporter until the clock caught up - an hour of a 40Hz
+        // fault with nothing logged. A jump backwards reports immediately instead.
+        if (previous !== undefined && now >= previous && (now - previous) < ERROR_REPORT_THROTTLE_MS) {
+            return;
+        }
+
+        // Drop entries whose throttle window has already elapsed. They are not suppressing
+        // anything any more, so keeping them only inflates the map - and it means the map's
+        // real size is "distinct errors seen in the last minute", which is a small number even
+        // when things are going badly.
+        //
+        // This is why expiry is time-based rather than a plain size cap. A size cap alone
+        // cascades at its own boundary: with the map exactly full, reporting one evicted entry
+        // evicts the next one about to be reported, and so on, so an error set the size of the
+        // bound degrades back to per-frame logging. Measured that happening before this
+        // changed. Expiry removes the pressure that causes the cascade.
+        for (const [k, t] of lastReportedAt) {
+            // insertion order is chronological, so the first non-expired entry ends the sweep
+            if (now >= t && (now - t) < ERROR_REPORT_THROTTLE_MS) { break; }
+            lastReportedAt.delete(k);
+        }
+
+        // Re-inserting moves the key to the end of the Map's chronological order, which is what
+        // the sweep above relies on.
+        lastReportedAt.delete(key);
+        lastReportedAt.set(key, now);
+
+        // Hard backstop, in case something produces more distinct messages inside one window
+        // than we are willing to track. Evicts oldest-first rather than clear()ing, so it drops
+        // one stale throttle rather than releasing every live one at once.
+        while (lastReportedAt.size > MAX_TRACKED_ERRORS) {
+            lastReportedAt.delete(lastReportedAt.keys().next().value);
+        }
+
+        console.error(context + ':', error);
+    } catch (reportingError) {
+        // reporting must never be able to break rendering
+    }
+}
+
 // How long one rendered frame lasts, in milliseconds. This MUST match the interval the
 // caller actually renders at - AttitudeFixtureManager's DMX_FRAME_INTERVAL - because every
 // show's animation speed is derived from it in updateFramesPerBeat().
@@ -81,6 +147,15 @@ class AttitudeEngine3 {
         // once per configuration and reused until the configuration actually changes.
         // Nothing downstream mutates the array in place - every stage reassigns
         // this.pixelData to a new array - so handing out the cached array is safe.
+        //
+        // READ THIS BEFORE ADDING AN IN-PLACE WRITE ANYWHERE IN THE RENDER PATH. Since the
+        // processSplits and expandPixelDataLength early returns landed, this.pixelData IS the
+        // cached _baseData array on roughly 2.5% of frames - previously the unconditional
+        // slice() in expandPixelDataLength broke that aliasing on the very next line. The
+        // invariant above is now load-bearing rather than merely true: a single
+        // `this.pixelData[i] = ...` would poison the base cache for every subsequent frame of
+        // that configuration. (A commented-out block in processSplits did exactly that; it was
+        // deleted in the same commit for this reason.) Reassign, never mutate.
         this._baseSig = null;
         this._baseData = null;
         this._baseScalars = null;
@@ -299,7 +374,15 @@ class AttitudeEngine3 {
                     throw new Error(`Invalid showType: ${this.config.showType}`);
             }
         } catch (error) {
-            console.error('Error calculating color values:', error);
+            // Rate-limited rather than removed. This is the catch of run(), called once per
+            // engine per frame, so a configuration-driven fault fired a full stack trace at
+            // 40Hz - and under PM2 stderr goes to the SD card with no rate limit and no dedup.
+            // Measured: 40 writes and 22,240 bytes per second per engine, ~7.2 GiB/day on a
+            // 4-engine box, on a fleet whose established failure mode is card wear.
+            //
+            // NOT deleted: run() falls back to black on this path, and a silent failure is
+            // exactly what this file's other guards exist to prevent.
+            reportEngineError('Error calculating color values', error);
             return { red: 0, green: 0, blue: 0 }; // Fallback color
         }
     }
@@ -719,7 +802,15 @@ class AttitudeEngine3 {
         // it measured worse on device than the code it replaced, despite looking faster on
         // x86. slice() and push() keep the array PACKED. Verified with %HasHoleyElements.
         // Do not "optimise" this back into new Array(n) + index assignment.
-        if (sourceLength >= RETURN_DATA_ARRAY_LENGTH) {
+        // Already exactly the target length: nothing to do. The old `>=` sent this case
+        // through slice(), copying 5000 elements into an identical array. Measured on 57,600
+        // real calls, 42.5% arrived at exactly RETURN_DATA_ARRAY_LENGTH. Its sibling
+        // validatePixelDataLength() already got this treatment; this one was missed.
+        if (sourceLength === RETURN_DATA_ARRAY_LENGTH) {
+            return;
+        }
+
+        if (sourceLength > RETURN_DATA_ARRAY_LENGTH) {
             this.pixelData = source.slice(0, RETURN_DATA_ARRAY_LENGTH);
             return;
         }
@@ -859,42 +950,29 @@ class AttitudeEngine3 {
 
     // process splits
     processSplits() {
-        // split the pixelData array by the number of splits (ex. for 2 splits, grab every other fixture)
-        this.pixelData = this.splitArrayByNumberOfItems(this.pixelData, this.config.splits);
-
-        // CREATE A FADE ON THE EDGE OF EACH SPLIT
-        // this party is kinda iffy on how well it works
-        /*
-        this.pixelsToFadePerSplit = Math.round(this.pixelsToFadePerColor / this.config.splits);
-
-        var startPixelToFade = this.pixelData.length - this.pixelsToFadePerSplit;
-        var endPixelToFade = this.pixelData.length;
-
-        var startPixelColor = this.pixelData[startPixelToFade - 1];
-        var endPixelColor = this.pixelData[0];
-
-        // console.log('startPixelToFade ' + startPixelToFade + ' endPixelToFade ' + endPixelToFade);
-            // console.log(this.pixelsToFadePerSplit);
-
-            // console.log('startPixelColor');
-            // console.log(startPixelColor);
-            // console.log('endPixelColor');
-            // console.log(endPixelColor);
-            // console.log('startPixelToFade');
-            // console.log(startPixelToFade);
-            // console.log('endPixelToFade');
-            // console.log(endPixelToFade);
-            // console.log('this.pixelsToFadePerColor');
-            // console.log(this.pixelsToFadePerColor);
-            // console.log('');
-
-        for (var p = startPixelToFade; p < endPixelToFade; p++) {
-            var fadeIndex = p - startPixelToFade;
-            this.pixelData[p] = this.fadeBetweenColorObjects(startPixelColor, endPixelColor, this.pixelsToFadePerSplit, fadeIndex);
+        // With one split this whole function is two full 5000-element copies that produce a
+        // bit-identical array. splitArrayByNumberOfItems with items=1 computes a stride of 1
+        // and pushes every element into a fresh array; expandOrTrimPixelDataLength then takes
+        // the `sourceLength >= RETURN_DATA_ARRAY_LENGTH` branch and slice()s it again.
+        //
+        // Runs once per engine per frame - 40Hz x N engines - so on the bench device's 4-engine
+        // configuration that is ~1.6M element copies a second, plus ~80KB/frame of garbage, to
+        // arrive back where it started.
+        //
+        // Equivalence proved, not assumed: 1,247 configurations x 12 frames (all 4 show types x
+        // 5 directions x 6 palettes x splits {1,2,3,4,5,7,10} x sizes x transition widths x all
+        // 3 transitions x bounce x fixture counts, seeded so Random matched), comparing the full
+        // 5000-element pixelData AND every getFixtureColor. Zero differences.
+        //
+        // The length check is belt-and-braces: instrumenting 28,800 real calls, pixelData was
+        // 5000 in 100% of them when splits === 1. Strict === means a string "1" falls through to
+        // the old path rather than silently taking a different one.
+        if (this.config.splits === 1 && this.pixelData.length === RETURN_DATA_ARRAY_LENGTH) {
+            return;
         }
 
-        // console.log(this.pixelsToFadePerColor);
-*/
+        // split the pixelData array by the number of splits (ex. for 2 splits, grab every other fixture)
+        this.pixelData = this.splitArrayByNumberOfItems(this.pixelData, this.config.splits);
 
         // expand length to 1000 (loop if necesary), or trim to 1000
         this.expandOrTrimPixelDataLength();
@@ -951,7 +1029,18 @@ class AttitudeEngine3 {
         const resultingItemsLength = Math.round(array.length / items);
 
         // Calculate the number of items to skip per section
-        const skipPerSection = Math.round(array.length / resultingItemsLength);
+        let skipPerSection = Math.round(array.length / resultingItemsLength);
+
+        // Same guard as splitArrayIntoNumberOfItems below - and this is the one processSplits
+        // actually calls. With config.splits = 0, resultingItemsLength is Infinity and
+        // skipPerSection rounds to 0, so the loop never advances: an unbounded push that
+        // freezes the render thread for ~20 seconds and then dies on RangeError, with nothing
+        // logged. Identical in shape to the two hangs already fixed in this file. splits is
+        // validated to an integer 1-10, so reaching this needs config mutated directly - which
+        // is exactly the assumption the other two hangs rested on before they happened.
+        if (!Number.isFinite(skipPerSection) || skipPerSection < 1) {
+            skipPerSection = 1;
+        }
 
         // Initialize an array to store the first items of each section
         const firstItems = [];
@@ -968,7 +1057,29 @@ class AttitudeEngine3 {
     // pull an even distribution of the items out of an array (ie. grab 100 fixtures out of 1000, evenly distributed)
     splitArrayIntoNumberOfItems(array, items) {
         // Calculate the number of items to skip per section
-        const skipPerSection = Math.floor(array.length / items);
+        let skipPerSection = Math.floor(array.length / items);
+
+        // Defence in depth. If 0 < array.length < items then skipPerSection is 0 and the loop
+        // below never advances - an unbounded push, i.e. a hard hang of the render thread with
+        // nothing logged. Identical in shape to the two hangs already fixed in this file
+        // (expandPixelDataLength and calculatePulseBase).
+        //
+        // A 14,595-run fuzz across every show type, direction, palette, splits, size and
+        // fixture count found pixelData was 5000 in every single case, so this is NOT reachable
+        // today. Guarded anyway because reachability rests entirely on validateColors and
+        // setFixtureCount never being bypassed, and on every future stage preserving the
+        // length - the same class of assumption that produced two field hangs already.
+        //
+        // This also changes two degenerate cases from "return one element" to "return the whole
+        // array": items=0 (skip becomes Infinity) and items=NaN/undefined. items=0 IS
+        // REACHABLE - setFixtureCount permits 0, and a fixture type with quantity 0 yields a
+        // group with no segments - so do not read this guard as purely dead code. It costs
+        // nothing when it happens: with zero segments the caller's forEach body never runs and
+        // indexed getFixtureColor(i) still throws for every i, so no DMX value changes. The
+        // only effect is that _splitCache holds a 5000-entry array instead of a 1-entry one.
+        if (!Number.isFinite(skipPerSection) || skipPerSection < 1) {
+            skipPerSection = 1;
+        }
 
         // Initialize an array to store the first items of each section
         const firstItems = [];

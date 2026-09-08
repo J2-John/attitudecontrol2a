@@ -24,6 +24,21 @@ const SAMPLE_INTERVAL = 3000;  // interval for how often to check module statuse
 const SEND_TO_NETWORK_INTERVAL = 15000; // interval for how often to send module statuses to the server
 const UNRESPONSIVE_THRESHOLD = 35;  // number of seconds before considering a module unresponsive
 
+// How long a non-operational status is held before an 'operational' report may overwrite it.
+//
+// This was the bare literal 5 compared against a Date difference - which is MILLISECONDS, so
+// the window was 5ms, not 5 seconds. The comment above the check said "1 second" and the dead
+// console.log beside it said "5 sec"; nobody had noticed the units.
+//
+// What it actually cost: a TRANSIENT degraded is overwritten by the next frame's operational
+// 25ms later. With SAMPLE_INTERVAL at 3s and SEND_TO_NETWORK_INTERVAL at 15s, a status that
+// lives 25ms has essentially no chance of ever being sampled or reported - so intermittent
+// faults were invisible fleet-wide. (A PERSISTENT per-frame error was reported correctly even
+// at 5ms, because the two emits land ~1ms apart inside one frame.)
+//
+// Expect a step change in reported degradations after this ships. That is the point.
+const NON_OPERATIONAL_HOLD_MS = 5000;
+
 
 
 // ---------------------------------------------------------------------------
@@ -386,7 +401,7 @@ class ModuleStatusTracker {
             // check to make sure the existing one isnt an error, and we're within 1 second of it
             if (newModuleStatus.status == 'operational' 
                 && (this.modules[index].status == 'degraded' || this.modules[index].status == 'errored')
-                && ((newModuleStatus.timestamp - this.modules[index].timestamp) < 5)) {
+                && ((newModuleStatus.timestamp - this.modules[index].timestamp) < NON_OPERATIONAL_HOLD_MS)) {
                 // console.log('tried to add a new status that was operational within 5 sec of a non operational status');
 
                 // console.log('new one was ', newModuleStatus)

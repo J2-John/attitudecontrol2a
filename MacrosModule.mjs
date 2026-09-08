@@ -25,6 +25,19 @@ import configManager from './ConfigManager.mjs';
 // variables
 const SAMPLE_INTERVAL = 15000;  // interval for how often to process macros (should be 15000ms)
 const LAPTOP_MODE = (process.platform == 'darwin');
+
+// How long to wait before restarting pm2, and how hard to try.
+//
+// The delay gives the network module time to tell the server that the config delete worked
+// before this process disappears. 30 s against a 1 Hz sync is very generous, and it is left
+// alone: shortening it is unnecessary risk on the fleet's only remote-restart path.
+//
+// The attempts exist because the first pm2 restart is documented to fail - see the comment on
+// restartPm2Async. update.sh uses three; matching it keeps one number to reason about.
+const PM2_RESTART_DELAY_SECONDS = 30;
+const PM2_RESTART_ATTEMPTS = 3;
+const PM2_RESTART_ATTEMPT_LIST = '1 2 3';   // literal, not $(seq) - see pm2RestartCommand
+const PM2_RESTART_RETRY_SECONDS = 5;
 const MACROS_PROCESSING_TIMEOUT = 60000;  // should be 60000ms
 
 // ---------------------------------------------------------------- the legacy-updater bootstrap
@@ -83,7 +96,30 @@ class MacrosModule {
         this.restartCommandSuccess = false;
         this.updateCommandSuccess = false;
 
+        // Set when a pm2 restart fails after all its attempts, and never cleared by this
+        // process: the only thing that resolves it is the restart finally happening, which kills
+        // the process. See restartPm2Async.
+        this.restartFailure = null;
+
         this.rebootCommandResults = '';
+
+        // Seams, not configuration. Production never changes either of these; they exist so a
+        // test can execute THIS method rather than a restatement of it. The previous tests for
+        // the macro handlers passed on Windows precisely because nothing there could launch a
+        // shell, which is how seven of them came to prove nothing.
+        this.execCommand = exec;
+        // A LITERAL LIST, NOT $(seq). update.sh uses `for restart_attempt in 1 2 3` and that is
+        // not a stylistic choice: on a /bin/sh without seq the command substitution yields
+        // nothing, the loop body runs ZERO times, and the script falls straight to `exit 1` -
+        // byte-identical to three genuine pm2 failures, with the only evidence on stderr, which
+        // the callback ignored. Reproduced on dash: `sh: 1: seq: not found`, exit 1, pm2 never
+        // invoked. The fleet's only remote-restart path would silently do nothing while
+        // reporting a failure that implies pm2 was tried.
+        this.pm2RestartCommand = 'sleep ' + PM2_RESTART_DELAY_SECONDS + '; '
+            + 'for i in ' + PM2_RESTART_ATTEMPT_LIST + '; do '
+            + 'pm2 restart all && exit 0; '
+            + 'sleep ' + PM2_RESTART_RETRY_SECONDS + '; '
+            + 'done; exit 1';
         this.restartCommandResults = '';
         this.updateCommandResults = '';
 
@@ -209,6 +245,27 @@ class MacrosModule {
             }
             const { api, attempts } = decision;
 
+            // PRE-FLIGHT BEFORE THE ATTEMPT IS RECORDED.
+            //
+            // The attempt has to be written before the spawn - the updater restarts us - which
+            // means an updater that cannot launch at all still consumes one of
+            // LEGACY_BOOTSTRAP_MAX_ATTEMPTS. On a worn card that is three attempts across two
+            // retry windows and then a permanent "gave up", with no verified build record ever.
+            // Checking first costs nothing and keeps the budget for attempts that could work.
+            //
+            // The chmod is hoisted above this for the same reason it exists below: a lost
+            // executable bit should be repaired, not counted as a failure.
+            try { fs.chmodSync(updater, 0o755); } catch (error) { /* not fatal */ }
+
+            try {
+                fs.accessSync(updater, fs.constants.X_OK);
+            } catch (error) {
+                logger.error(`Cannot launch the updater for the legacy bootstrap: ${updater} is `
+                    + `missing or not executable (${error.code ?? error.message}). Not counting `
+                    + `this as an attempt.`);
+                return;
+            }
+
             // Written BEFORE the spawn, not after. The updater restarts this
             // process, so anything recorded afterwards may never be recorded.
             try {
@@ -224,10 +281,10 @@ class MacrosModule {
                 return;
             }
 
-            // rsync from a zip should preserve the executable bit, but a device
-            // that cannot run its own updater is not a failure worth inheriting
-            // from an archive's metadata.
-            try { fs.chmodSync(updater, 0o755); } catch (error) { /* not fatal */ }
+            // (the defensive chmod is now hoisted above the attempt write - see the
+            // pre-flight note there. rsync from a zip should preserve the executable bit, but a
+            // device that cannot run its own updater is not a failure worth inheriting from an
+            // archive's metadata.)
 
             logger.info(`This device has never run the validating updater (API ${api}). `
                 + `Running it once to establish a verified build record. `
@@ -276,35 +333,60 @@ class MacrosModule {
 
 
         // create a timeout Promise that will reject if it takes longer than 30 seconds
+        //
+        // The handle is kept so the loser of the race can be cancelled. Promise.race settles on
+        // the first promise but does not cancel the others, so every macro cycle used to leave a
+        // 60s timer pending - and processMacros runs every 15s, so up to four of them were alive
+        // at once, each holding a closure and keeping the event loop busy long after the work
+        // finished. Harmless in production, but it is a leak, and it made any test that drives
+        // processMacros hang for a full minute after it had already passed.
+        let timeoutHandle = null;
         const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => {
+            timeoutHandle = setTimeout(() => {
                 reject(new Error(`Timeout: Macro execution took longer than ${MACROS_PROCESSING_TIMEOUT}ms`));
             }, MACROS_PROCESSING_TIMEOUT); // timout length
         });
 
+        const clearMacroTimeout = () => {
+            if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+        };
 
-        // run the three different macro functions as promises
-        Promise.race([
+
+        // RETURNED, so a caller can await the cycle. init() drives this from a setInterval and
+        // ignores the result, which is why it was never returned - but a test that cannot await
+        // it has to re-emit the completion event by hand, and a test that re-emits by hand
+        // passes even when the code it is checking is wrong. That escaped a mutation run.
+        return Promise.race([
             Promise.all([this.handleReboot(), this.handleRestart(), this.handleUpdate()]), // race these three promises 
             timeoutPromise // with the timeout promise
         ])
         .then((results) => {
+            clearMacroTimeout();
+
             // log success
             if (configManager.checkLogLevel('detail')) {
                 logger.info(`Completed processing device macros!`);
             }
 
             // emit an event that the MacrosModule finished
-            eventHub.emit('moduleStatus', { 
-                name: 'MacrosModule', 
-                status: 'operational',
-                data: 'Completed processing device macros!',
+            //
+            // An outstanding restart failure OUTRANKS this. The restart is attempted ~40 s after
+            // the macro completes, so by the time it fails this handler has already reported
+            // 'operational' - and would do so again every 15 s, erasing the failure from the one
+            // status the tracker keeps. A device that deleted its config.json and never restarted
+            // must not read as healthy.
+            eventHub.emit('moduleStatus', {
+                name: 'MacrosModule',
+                status: this.restartFailure ? 'errored' : 'operational',
+                data: this.restartFailure || 'Completed processing device macros!',
             });
 
             // emit macros event, to send completed data back to server
             this.emitMacrosEvent();
         })
         .catch((error) => {
+            clearMacroTimeout();
+
             // log the error
             logger.error(`Error processing device macros: ${error}`);
 
@@ -432,20 +514,39 @@ class MacrosModule {
                     // that the delete config part worked
                     this.restartPm2Async();
 
-                    // set this.restartCommandSuccess to true to indicate that the command was successful
+                    // WHAT THIS FLAG ATTESTS, precisely: config.json was deleted. It does NOT
+                    // attest that pm2 restarted - that has not been attempted yet and will not
+                    // be for another 30 seconds.
+                    //
+                    // Reporting success here is nonetheless the RIGHT direction, and the reason
+                    // is worth writing down because the instinct is to "fix" it the other way.
+                    // The server flag is `deleteconfig`, and the delete has genuinely happened
+                    // and is durable. Consider the alternative: report failure, and if the
+                    // restart then succeeds, this process dies mid-report, the flag stays set,
+                    // and on the next cycle the device deletes its config and restarts AGAIN -
+                    // a restart loop on the fleet's only remote-restart path. A wrongly-withheld
+                    // success costs one stale in-memory config until something restarts the
+                    // device; a wrongly-reported failure costs a loop. Same asymmetry the update
+                    // guard reasons from.
+                    //
+                    // The restart's own outcome therefore needs its own channel, and it has one:
+                    // restartPm2Async reports a failure on `moduleStatus`, which is emitted every
+                    // cycle regardless of whether any macro is still queued. See that method.
                     this.restartCommandSuccess = true;
 
-                    // set the restartCommandResults variable to a success string
-                    this.restartCommandResults = 'config.json successfully deleted and pm2 restart queued for 30 seconds from now!';
+                    // Says "queued", not "restarted" - the string was already honest, and stays
+                    // that way. Only the number is now derived from the constant.
+                    this.restartCommandResults = 'config.json successfully deleted and pm2 restart '
+                        + 'queued for ' + PM2_RESTART_DELAY_SECONDS + ' seconds from now!';
 
                     // log the success
-                    logger.info(`config.json successfully deleted and pm2 restart queued for 30 seconds from now!`);
+                    logger.info(this.restartCommandResults);
 
                     // emit a success event
-                    eventHub.emit('moduleStatus', { 
-                        name: 'MacrosModule', 
+                    eventHub.emit('moduleStatus', {
+                        name: 'MacrosModule',
                         status: 'operational',
-                        data: `config.json successfully deleted and pm2 restart queued for 30 seconds from now!`,
+                        data: this.restartCommandResults,
                     });
 
                     // resolve with the success text
@@ -521,6 +622,60 @@ class MacrosModule {
                 // outcome lands in attitude-build.json, which StatusTracker already reports on
                 // the normal status cycle. Waiting for a process whose job is to kill us was
                 // never going to work.
+                // PRE-FLIGHT, AND IT HAS TO BE SYNCHRONOUS.
+                //
+                // spawn() does NOT throw for a missing or non-executable update.sh. It reports
+                // that asynchronously, as an 'error' event - verified: spawn('./update.sh') in a
+                // directory with no update.sh returns a ChildProcess without throwing, and the
+                // ENOENT arrives on a later tick. The try/catch below cannot see it.
+                //
+                // Two consequences, and both are the failure this fleet cannot afford:
+                //
+                //   1. updateCommandSuccess was set TRUE, so macrosStatus told the server the
+                //      update had succeeded and the server CLEARED THE UPDATE FLAG - with no
+                //      updater having run. The device stays on its old firmware, the server
+                //      believes it updated, and the flag that is the only channel to that device
+                //      has been spent. That is a site visit.
+                //   2. A ChildProcess 'error' with no listener is an uncaught exception. The app
+                //      goes down.
+                //
+                // The bootstrap path in this same file already guards both - it chmods the
+                // updater and registers an 'error' listener, with a comment explaining exactly
+                // this hazard. That was added in 2.A.19 and never carried across to here, which
+                // is the drift class this review keeps finding, this time inside one file.
+                //
+                // The synchronous check is the load-bearing half: handleUpdate() resolves
+                // immediately and emitMacrosEvent() runs on the next microtask, so an async
+                // 'error' arrives too late to correct what was already reported. Only a check
+                // made BEFORE the spawn can keep the flag.
+                const updater = path.join(process.cwd(), 'update.sh');
+
+                // rsync from a zip should preserve the executable bit, but a device that cannot
+                // run its own updater is not a failure worth inheriting from archive metadata.
+                // Same defence, same reasoning, as the bootstrap path.
+                try { fs.chmodSync(updater, 0o755); } catch (error) { /* not fatal */ }
+
+                try {
+                    fs.accessSync(updater, fs.constants.X_OK);
+                } catch (error) {
+                    this.updateCommandSuccess = false;
+                    this.updateCommandResults = `Cannot launch the updater: ${updater} is missing `
+                        + `or not executable (${error.code ?? error.message}). The update flag is `
+                        + `deliberately NOT acknowledged, so the server keeps it and this device `
+                        + `can retry once the updater is restored.`;
+
+                    logger.error(this.updateCommandResults);
+
+                    eventHub.emit('moduleStatus', {
+                        name: 'MacrosModule',
+                        status: 'errored',
+                        data: this.updateCommandResults,
+                    });
+
+                    resolve(this.updateCommandResults);
+                    return;
+                }
+
                 try {
                     const child = spawn('./update.sh', [], {
                         detached: true,
@@ -528,13 +683,75 @@ class MacrosModule {
                         cwd: process.cwd(),
                     });
 
-                    // let it go - without this, node keeps a handle to it and waits
-                    child.unref();
+                    // RESOLVE FROM THE EVENTS, NOT FROM spawn() RETURNING.
+                    //
+                    // spawn() returning a ChildProcess means nothing about whether the updater
+                    // launched. Exactly one of 'spawn' and 'error' always follows, on a later
+                    // tick, and that is the only place the outcome is actually known.
+                    //
+                    // An earlier version of this fix set updateCommandSuccess = true here and
+                    // corrected it from an 'error' listener. That was WORSE THAN THE BUG IT
+                    // REPLACED, and the ordering is why: handleUpdate() resolves immediately,
+                    // emitMacrosEvent() runs on the next microtask, and the 'error' event lands
+                    // after it. So macrosStatus reported success, the server cleared the update
+                    // flag, and the correction was never sent - emitMacrosEvent() only emits
+                    // when a macro is queued, and by then the flag was gone. Measured across
+                    // three real cycles: reported true, then silence.
+                    //
+                    // Before that version, the same input threw an uncaught exception. The
+                    // macrosStatus payload was only ENQUEUED and drains on the ~1s sync, so the
+                    // pm2 restart discarded it and the flag survived. Accidentally safe. Turning
+                    // that into a cleared flag would have stranded the device.
+                    //
+                    // 'spawn' has been emitted since Node 15.1; the fleet runs 16.20.2.
+                    let settled = false;
 
-                    this.updateCommandSuccess = true;
-                    this.updateCommandResults = 'Update launched. This app will be restarted by the updater; the outcome is reported in the build state.';
+                    child.once('spawn', () => {
+                        if (settled) { return; }
+                        settled = true;
 
-                    logger.info(this.updateCommandResults);
+                        // let it go - without this, node keeps a handle to it and waits
+                        child.unref();
+
+                        this.updateCommandSuccess = true;
+                        this.updateCommandResults = 'Update launched. This app will be restarted by the updater; the outcome is reported in the build state.';
+
+                        logger.info(this.updateCommandResults);
+
+                        eventHub.emit('moduleStatus', {
+                            name: 'MacrosModule',
+                            status: 'operational',
+                            data: this.updateCommandResults,
+                        });
+
+                        resolve(this.updateCommandResults);
+                    });
+
+                    // Never absent, for two reasons. A ChildProcess 'error' with no listener is
+                    // an uncaught exception, so the crash would land on the device that most
+                    // needs to stay up to receive its next flag. And this is the only signal
+                    // that distinguishes a launch from a failure to launch - the pre-flight
+                    // above cannot see a corrupt update.sh, because access(X_OK) tests the
+                    // permission bits while the kernel resolves the shebang only at exec.
+                    child.once('error', (err) => {
+                        if (settled) { return; }
+                        settled = true;
+
+                        this.updateCommandSuccess = false;
+                        this.updateCommandResults = `The updater failed to launch: ${err}. The `
+                            + `update flag is deliberately NOT acknowledged, so the server keeps `
+                            + `it and this device can retry.`;
+
+                        logger.error(this.updateCommandResults);
+
+                        eventHub.emit('moduleStatus', {
+                            name: 'MacrosModule',
+                            status: 'errored',
+                            data: this.updateCommandResults,
+                        });
+
+                        resolve(this.updateCommandResults);
+                    });
 
                     // NOTE: restartPm2Async() is deliberately NOT called here.
                     //
@@ -546,14 +763,6 @@ class MacrosModule {
                     //
                     // update.sh restarts the app itself, at the right moment, and watches what
                     // happens next. Nothing else should be restarting anything.
-
-                    eventHub.emit('moduleStatus', {
-                        name: 'MacrosModule',
-                        status: 'operational',
-                        data: this.updateCommandResults,
-                    });
-
-                    resolve(this.updateCommandResults);
                 } catch (error) {
                     this.updateCommandSuccess = false;
                     this.updateCommandResults = `An error occurred launching the update: ${error}`;
@@ -581,25 +790,85 @@ class MacrosModule {
 
 
 
+    // restartPm2Async - the restart half of the delete-config-and-restart macro.
+    //
+    // WHAT THIS FIXES
+    //
+    // The old form was `sleep 30; pm2 restart all`, fired once, with a callback that only
+    // logged. Three things followed from that, and the third is the one that matters:
+    //
+    //   1. ONE ATTEMPT, on a call that is documented to fail on its first try. From
+    //      INCIDENT-update-flag-lost-between-syncs, observed two devices out of two:
+    //        AC-0020151  18:25:11  pm2 restart attempt 1 of 3 failed  -> succeeded 18 min later
+    //        AC-0020140  19:08:23  pm2 restart attempt 1 of 3 failed  -> succeeded 22 s later
+    //      Those lines come from update.sh, which retries three times and therefore recovers.
+    //      This path had no retry at all, so the same first-attempt failure simply meant the
+    //      device never restarted. The incident doc calls this "the most valuable unexplained
+    //      thing left"; it is still unexplained, and retrying is what update.sh does about it.
+    //
+    //   2. NOTHING RECORDED THE OUTCOME. The callback logged to the device's own log, which is
+    //      only useful to someone already looking at that device.
+    //
+    //   3. A FAILURE WAS STRUCTURALLY UNREPORTABLE - the same trap as the updater-launch defect
+    //      fixed in batch 5. handleRestart() reports success as soon as config.json is deleted,
+    //      the server clears `deleteconfig`, so `restartQueuedFromServer` is false by the time
+    //      this callback fires ~30 s later - and emitMacrosEvent() only emits while a macro is
+    //      queued. So the correction had no channel to travel on. It still does not, which is
+    //      why the failure now goes out on `moduleStatus` instead: that stream is emitted every
+    //      cycle regardless of any macro flag, so it is the one channel still open.
+    //
+    // The 30-second delay and `pm2 restart all` are both unchanged, deliberately - see the
+    // note at the end of this comment.
+    //
+    // The retry loop stays inside the shell rather than becoming JS timers. That survives a bare
+    // parent exit - the child holds the sleep - but NOT a process-group kill, and pm2's default
+    // kill signal is SIGINT delivered to the whole tree, which handleUpdate's comment two hundred
+    // lines above already says. Demonstrated: exec() does not detach, parent and child share a
+    // pgid, and a group signal takes both. So this is a weak property, not the guarantee an
+    // earlier version of this comment claimed. The reason to keep the loop in the shell is
+    // simplicity; the reason to keep it at all is the documented first-attempt failure.
     async restartPm2Async() {
-        // Command to async restart PM2 after 30 sec
-        const command = 'sleep 30; pm2 restart all';
+        const command = this.pm2RestartCommand;
 
-        // Execute the command
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                // log the error
-                logger.error(`PM2 restart command failed with error: ${error}`);
-            } else {
-                // otherwise success
+        return new Promise((resolve) => {
+            this.execCommand(command, (error, stdout, stderr) => {
+                if (error) {
+                    // stderr is the ONLY thing that separates "pm2 failed three times" from "the
+                    // shell could not run the loop at all". It was captured and discarded.
+                    const detail = (stderr && String(stderr).trim())
+                        ? ` (stderr: ${String(stderr).trim().slice(0, 200)})`
+                        : '';
 
-                // the problem here is that this code will never execute,
-                // because if the pm2 restart all command is successful
-                // then this code will be killed and restarted anyway
+                    this.restartCommandResults = `config.json was deleted, but the pm2 restart `
+                        + `failed after up to ${PM2_RESTART_ATTEMPTS} attempts: ${error.message}`
+                        + detail;
 
-                // we'll go ahead and log the success, but this message will probably never be seen by anyone
-                logger.info(`PM2 restart command success!`);
-            }
+                    logger.error(this.restartCommandResults);
+
+                    // The macro channel is gone by now (see 3 above). moduleStatus is not.
+                    eventHub.emit('moduleStatus', {
+                        name: 'MacrosModule',
+                        status: 'errored',
+                        data: this.restartCommandResults,
+                    });
+
+                    // STICKY. ModuleStatusTracker keeps ONE status per module name, and
+                    // processMacros emits 'operational' on completion every 15 s - so this
+                    // errored status was overwritten before a network send could carry it,
+                    // roughly half the time. The comment claiming moduleStatus is "the one
+                    // channel still open" was only true for the instant it was emitted.
+                    this.restartFailure = this.restartCommandResults;
+
+                    resolve(false);
+                } else {
+                    // Usually never reached: a successful `pm2 restart` kills this process
+                    // before the callback can run. Its absence is not evidence of failure,
+                    // which is exactly why the failure branch above has to be the loud one.
+                    logger.info('PM2 restart command success!');
+
+                    resolve(true);
+                }
+            });
         });
     }
 

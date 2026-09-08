@@ -20,6 +20,18 @@ const logger = new Logger('ConfigManager');
 // variables
 const CONFIG_FILE_PATH = './';  // path to save the config JSON file to
 
+// Keys that arrive in a sync reply but are NOT configuration and must never be persisted.
+//
+// Show tables are memory-only by contract (see ShowTableStore's header). They reached the SD
+// card because NetworkModule merged the entire reply into the config and update() persists
+// whatever it merged. NetworkModule now strips these before calling update(); loadFromFile()
+// purges any that an earlier build already wrote.
+//
+// If the server grows another transport-only key, add it here AND to the destructure in
+// NetworkModule.handleResponse - a blocklist only protects the keys it knows about, which is
+// why the safer long-term shape is an allowlist of things that ARE configuration.
+export const TRANSPORT_ONLY_KEYS = ['showTables', 'dropShowTables'];
+
 
 
 // Define the ConfigManager class to handle everything about the device's configuration
@@ -65,15 +77,47 @@ class ConfigManager {
 			// load the raw data as a string from the file at this path
 			const rawData = fs.readFileSync(this.filePath);
 
-			// parse JSON data
-			const parsedData = JSON.parse(rawData);
-
 			// replace current config with the data from the file
+			// (this used to parse rawData twice - once into an unused local, once into
+			// this.config - which doubled config parse cost on every boot)
 			this.config = JSON.parse(rawData);
+
+			// Purge transport-only keys that an earlier build persisted.
+			//
+			// Show tables are memory-only by design, but NetworkModule used to merge the whole
+			// sync reply into the config, so any device that ever received a table has base64
+			// blobs sitting in its config.json. mergeObjects has no delete path, so they would
+			// otherwise stay there for the life of the card - re-parsed on every boot and
+			// re-serialised on every write-guard comparison. Fixing the transport is not
+			// enough on its own; this is what actually cleans an affected device.
+			let purged = false;
+
+			for (const key of TRANSPORT_ONLY_KEYS) {
+				if (Object.prototype.hasOwnProperty.call(this.config, key)) {
+					delete this.config[key];
+					purged = true;
+				}
+			}
 
 			// seed the write guard with the normalized form of what is already on disk, so
 			// an unchanged config after boot does not trigger a pointless rewrite
 			this.lastWrittenSerialized = JSON.stringify(this.config, null, 2);
+
+			// if we purged something, the file on disk no longer matches - write once, now,
+			// so the blobs actually leave the card rather than lingering until the next
+			// unrelated config change.
+			if (purged) {
+				logger.info('Purged transport-only keys from persisted config (show tables are memory-only).');
+
+				// Force the write by clearing the guard, then restore it to match the purged
+				// config whether or not the write actually landed. If saveToFile() fails (a
+				// card that is already failing writes - precisely the population this guard
+				// exists for), leaving lastWrittenSerialized null would make EVERY subsequent
+				// saveToFile retry a write at 1Hz instead of hitting the byte-compare skip.
+				this.lastWrittenSerialized = null;
+				this.saveToFile();
+				this.lastWrittenSerialized = JSON.stringify(this.config, null, 2);
+			}
 
 			// log success
 			logger.info('Successfully loaded configuration data from local JSON file!');
@@ -233,8 +277,19 @@ class ConfigManager {
         // if undefined then log that we have an error and return empty array
         if (data === undefined) {
         	// only log error if this.config is actually defined. otherwise, we just haven't gotten any config data yet
-        	if (!Object.keys(this.config).length === 0) {
-        		logger.error(`Error accessing fixtures!`);
+        	// was `!Object.keys(this.config).length === 0`, which parses as
+        	// (boolean) === 0 and is therefore ALWAYS false - so a populated config that was
+        	// missing `fixtures` returned [] in total silence, every fixture at the site froze
+        	// on its last DMX value, and this line never printed.
+        	if (Object.keys(this.config).length !== 0) {
+        		logger.error(`Error accessing fixtures! Config is loaded but has no fixtures key.`);
+
+        		eventHub.emit('moduleStatus', {
+        			name: 'ConfigManager',
+        			status: 'degraded',
+        			data: 'Config is loaded but contains no fixtures.',
+        			oneTimeEvent: true,
+        		});
         	}
 
         	// TODO either way, emit an error to the module status tracker

@@ -117,6 +117,24 @@ class AttitudeScheduler {
 
     // process the schedule at regular intervals
     processSchedule() {
+    	// Clear the degraded flag at the START of every pass, so it means "THIS pass failed"
+    	// rather than "some pass failed once, ever".
+    	//
+    	// It was set true in four catch blocks and cleared nowhere - `grep "degraded = false"`
+    	// returned zero matches, and it was never even initialised in the constructor. One
+    	// malformed custom block, one unparseable override.showsdata, one missing sense, and
+    	// the scheduler reported 'degraded' to the server for the entire life of the process.
+    	// Only a reboot cleared it.
+    	//
+    	// That status is load-bearing: ModuleStatusTracker turns it into a blue LED and an
+    	// overall 'degraded' on /admin/fleet, so a device that recovered an hour ago looked
+    	// identical to one still broken - and every genuinely new fault at that site was
+    	// invisible, because the box was already saying degraded.
+    	//
+    	// This MUST be at the top. Clearing it at the end would clear it before the read below
+    	// and pin the status permanently 'operational' - the exact false pass we are removing.
+    	this.degraded = false;
+
     	// try to process schedule
     	try {
     		// grab the most up to date schedule config blocks & timestamp from configManager
@@ -482,7 +500,7 @@ class AttitudeScheduler {
 									activeUntil.setHours(activeUntil.getHours() + duration);
 									break;
 								default:
-									console.warn("Invalid timeMode");
+									logger.warn("Invalid timeMode");
 									return;
 							}
 
@@ -588,7 +606,21 @@ class AttitudeScheduler {
     		this.processedShowIds.webOverrides = new Array(MAX_ZONES_COUNT).fill(0);
 
     		// loop through each web override in reverse order
+		    //
+		    // Each row is isolated in its own try/catch. Previously a single unresolvable
+		    // override_id threw out of this forEach into the function-level catch below, which
+		    // zeroes the ENTIRE webOverrides layer - so one bad row disabled every web override
+		    // at that location, including the manual-control buttons staff use during a service
+		    // call, and pinned the scheduler degraded. Deleting the row an active web override
+		    // points at is an ordinary web-app action with no device-side coupling.
+		    //
+		    // processOverrides, two functions up, already gets this right: it logs and returns
+		    // so one bad port costs one port. Note the loop is .slice().reverse(), so WHICH
+		    // rows survived a throw used to depend on ordering; per-row isolation removes that.
+		    let webOverrideFailures = 0;
+
 		    this.webOverrides.slice().reverse().forEach(webOverride => {
+		      try {
 		    	// if it's active
 		        if (webOverride.active) {
 		        	// if it doesn't have a web override assigned to it
@@ -619,11 +651,24 @@ class AttitudeScheduler {
 			            // now map the showdata from the override to the webOverrides layer
 		                this.processedShowIds.webOverrides = this.layerAnOverride(this.processedShowIds.webOverrides, [...overrideShowData]);
 		            } else {
-		            	// throw an error since this override couldnt be found
-		            	throw new Error('Invalid override_id for this web overrride!');
+		            	// this override no longer exists. that costs THIS row, not all of them.
+		            	throw new Error(`Invalid override_id ${webOverride.override_id} for web override "${webOverride.name}"`);
 		            }
 		        }
+		      } catch (rowError) {
+		        // One bad row must not take the others with it. Still surfaced, because a
+		        // silently dropped row would remove the only signal that a web override is
+		        // misconfigured - which is the failure mode this codebase keeps writing
+		        // guards against.
+		        webOverrideFailures++;
+		        logger.error(`Skipping web override "${webOverride?.name}": ${rowError.message}`);
+		      }
 		    });
+
+		    // a row-level failure is degraded, but the surviving rows still applied
+		    if (webOverrideFailures > 0) {
+		    	this.degraded = true;
+		    }
 
 		    // log that we finished (optional)
 		    if (configManager.checkLogLevel('detail')) {
@@ -661,8 +706,31 @@ class AttitudeScheduler {
 			if (Array.isArray(layer[z])) {
 				// Ensure zone is treated as an array
 				const oldZoneData = Array.isArray(zone) ? zone : [zone];
-				
-				return layer[z].map((group, g) => {
+
+				// Walk the WIDER of the two, not the layer's length.
+				//
+				// This used to be `layer[z].map(...)`, so the result took the LAYER's group
+				// count. A layer with FEWER groups than the base silently dropped the extra
+				// base groups - and downstream AttitudeFixtureManager resolves a missing group
+				// via `?? 0`, where show id 0 renders BLACK. Not white, not the previous show:
+				// off.
+				//
+				//   base  [11,12,13,14]  +  layer [0,0]  ->  was [11,12]      (3 and 4 dark)
+				//                                            now [11,12,13,14]
+				//
+				// Reached whenever an override, custom block or web override was authored
+				// against a zone that has since gained a group - an ordinary sequence of
+				// events in the web app. The override does not even have to intend a change:
+				// [0,0] means "change nothing" and still blacked out half the zone.
+				//
+				// The OPPOSITE direction is load-bearing and already worked - a layer LONGER
+				// than the base expands it, and a scalar base with an array layer expands too -
+				// which is why this takes the max rather than simply switching to base.map.
+				const width = Math.max(oldZoneData.length, layer[z].length);
+
+				return Array.from({ length: width }, (_, g) => {
+					const group = layer[z][g];
+
 					if (group > 0) {
 						// Group is set to override, so use the new layer data for this group
 						return group;

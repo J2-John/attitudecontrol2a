@@ -24,6 +24,7 @@ import networkModule from './NetworkModule.mjs';
 import statusTracker from './StatusTracker.mjs';
 import moduleStatusTracker from './ModuleStatusTracker.mjs';
 import macrosModule from './MacrosModule.mjs';
+import renderWatchdog from './RenderWatchdog.mjs';
 import udpManager from './UDPManager.mjs';
 
 
@@ -72,6 +73,15 @@ setTimeout(() => {
 setTimeout(() => {
 	attitudeScheduler.init();
 	attitudeFixtureManager.init();
+
+	// Frozen-output watchdog. Started alongside the fixture manager because it watches that
+	// module's frames, and given its own timer rather than being called from processFixtures -
+	// a status emitted from inside that function competes with the degraded/operational pair it
+	// already emits per frame, and ModuleStatusTracker's hold window decides which survives.
+	//
+	// Dependencies are passed in rather than imported by the watchdog, so its tests drive the
+	// real tick() with a fake clock and a fake event hub instead of restating it.
+	renderWatchdog.init({ eventHub, attitudeSACN, logger });
 }, 60);
 
 

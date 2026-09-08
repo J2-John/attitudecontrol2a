@@ -21,6 +21,23 @@ const logger = new Logger('AttitudeSenseManager');
 // ==================== VARIABLES ====================
 const LAPTOP_MODE = (process.platform == 'darwin');
 
+// How long a sense packet stays valid before the unit is treated as absent.
+//
+// mostRecentPacketFromEachSense had no expiry at all: set, has, get, and nothing else. A sense
+// that had EVER been heard from was always "found", however long ago. So a unit powered down or
+// unplugged while a port was asserted latched that port active FOREVER - a toggle-mode override
+// stayed layered on every pass, for days, outranking both the weekly schedule and custom blocks,
+// with no way to dislodge it. Pulse mode was worse: its self-expiry is defeated because the port
+// still reads active, so activeUntil is refreshed on every tick and the pulse re-arms forever.
+//
+// The comment on getSensePortDataById already promised the correct behaviour ("default response
+// if ID is not found is array of zeroes so that no ports will be active"); it just never applied
+// to a stale unit. AttitudeEmitManager has exactly this TTL, with a written rationale.
+//
+// SET THIS AGAINST THE SENSE FIRMWARE'S REAL ANNOUNCE INTERVAL. Too short and live triggers get
+// dropped. 60s matches EMIT_ADDRESS_TTL_MS and is comfortably longer than the observed rate.
+const SENSE_PACKET_TTL_MS = 60000;
+
 
 
 
@@ -94,7 +111,8 @@ class AttitudeSenseManager {
     		// console.log(`New packet from sense ID: ${object.ID} with data ${object.DATA}`);
 
     		// update the map with the most recent packet from each sense
-            this.mostRecentPacketFromEachSense.set(object.ID, object);
+            // stamp arrival time so a unit that goes quiet can age out (see SENSE_PACKET_TTL_MS)
+            this.mostRecentPacketFromEachSense.set(object.ID, { ...object, receivedAt: Date.now() });
 
             // process the data array from the sense's ports (string to array)
             const processedDataArrray = this.processSensePortData(object.DATA);
@@ -189,14 +207,25 @@ class AttitudeSenseManager {
 		// Convert the ID to an integer
 	    const intId = parseInt(id);
 
-		// Check if the ID exists in the map
-	    if (this.mostRecentPacketFromEachSense.has(intId)) {
-	        // Retrieve the data packet for the given ID
-	        const dataPacket = this.mostRecentPacketFromEachSense.get(intId);
+		// Check if the ID exists in the map AND is still fresh. A packet older than the TTL
+		// means the unit has gone quiet, and a silent sense must read as "no ports active"
+		// rather than holding whatever it last reported - see SENSE_PACKET_TTL_MS.
+	    const dataPacket = this.mostRecentPacketFromEachSense.get(intId);
+	    const isFresh = dataPacket
+	        && typeof dataPacket.receivedAt === 'number'
+	        && (Date.now() - dataPacket.receivedAt) < SENSE_PACKET_TTL_MS;
 
+	    if (isFresh) {
 	        // Convert the DATA string to an array
 	        return this.processSensePortData(dataPacket.DATA);
 	    } else {
+	    	// a stale entry is dropped so it cannot be served again, and so a returning unit
+	    	// starts clean rather than inheriting its own pre-outage state
+	    	if (dataPacket) {
+	    		this.mostRecentPacketFromEachSense.delete(intId);
+	    		logger.warn(`Sense ID ${id} has not reported within ${SENSE_PACKET_TTL_MS}ms - treating its ports as inactive.`);
+	    	}
+
     		// if detail log level, log that this sense couldn't be found
 			if (configManager.checkLogLevel('detail')) {
     			logger.warn(`getSensePortDataById: Sense ID ${id} couldn't be found!`);
